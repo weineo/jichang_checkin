@@ -38,45 +38,6 @@ def push_notification(title, content):
     except:
         pass
 
-def wait_for_turnstile(page, timeout=40000):
-    """等待Cloudflare Turnstile验证完成"""
-    print("🔄 检测Turnstile验证...")
-    
-    # 检查是否有Turnstile iframe
-    if not page.query_selector('iframe[src*="challenges.cloudflare.com"]'):
-        print("ℹ️  未检测到Turnstile，跳过")
-        return True
-    
-    start = time.time()
-    while time.time() - start < timeout / 1000:
-        try:
-            # 方法1: 检查token是否生成
-            token = page.evaluate("""
-                () => {
-                    const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-                    if (!iframe) return null;
-                    try {
-                        return iframe.contentWindow?.document.querySelector('input[name="cf-turnstile-response"]')?.value;
-                    } catch { return null; }
-                }
-            """)
-            if token and len(token) > 20:
-                print("✅ Turnstile验证通过（检测到token）")
-                return True
-        except:
-            pass
-        
-        # 方法2: 检查iframe是否消失
-        if not page.query_selector('iframe[src*="challenges.cloudflare.com"]'):
-            print("✅ Turnstile验证通过（iframe已消失）")
-            return True
-        
-        print(f"⏳ 等待Turnstile... ({int(time.time()-start)}s)")
-        time.sleep(3)
-    
-    print("⚠️ Turnstile等待超时，尝试继续")
-    return False
-
 def sign_account(index, email, password):
     print(f"\n{'='*20} 账号 {index+1} {'='*20}")
     print(f"👤 账号: {email}")
@@ -108,88 +69,47 @@ def sign_account(index, email, password):
             # 1️⃣ 访问主页
             print(f"🏠 访问主页...")
             page.goto(URL, wait_until='networkidle', timeout=60000)
-            time.sleep(5)  # 初始等待
+            time.sleep(5)
             
-            # 2️⃣ 等待Turnstile验证（关键！）
-            wait_for_turnstile(page)
-            time.sleep(2)  # 验证后稍等
-            
-            # 3️⃣ 检查是否已登录
-            if '/user' in page.url:
+            # 2️⃣ 检查是否已登录
+            if '/user' in page.url or page.query_selector('a[href="/user/logout"]'):
                 print("✅ 已是用户中心")
             else:
-                # 4️⃣ 填写登录表单
+                # 3️⃣ 填写登录表单
                 print("📝 填写登录信息...")
                 
-                # 🔥 使用更灵活的选择器（兼容多种写法）
-                email_selectors = ['input[name="email"]', 'input[type="email"]', '#email']
-                pwd_selectors = ['input[name="passwd"]', 'input[name="password"]', 'input[type="password"]', '#password']
+                # 邮箱
+                page.wait_for_selector('input[name="email"]', state='visible', timeout=15000)
+                page.fill('input[name="email"]', email)
                 
-                # 等待并填写邮箱
-                email_filled = False
-                for selector in email_selectors:
-                    try:
-                        el = page.wait_for_selector(selector, state='visible', timeout=10000)
-                        el.fill(email)
-                        print(f"✅ 填写邮箱: {selector}")
-                        email_filled = True
-                        break
-                    except:
-                        continue
-                
-                if not email_filled:
-                    print("❌ 未找到邮箱输入框")
-                    result_msg = f"账号 {email}: ❌ 未找到邮箱输入框"
-                    return result_msg
-                
-                # 等待并填写密码
-                pwd_filled = False
-                for selector in pwd_selectors:
-                    try:
-                        el = page.wait_for_selector(selector, state='visible', timeout=10000)
-                        el.fill(password)
-                        print(f"✅ 填写密码: {selector}")
-                        pwd_filled = True
-                        break
-                    except:
-                        continue
-                
-                if not pwd_filled:
-                    print("❌ 未找到密码输入框")
-                    result_msg = f"账号 {email}: ❌ 未找到密码输入框"
-                    return result_msg
-                
-                # 🔥 再次等待Turnstile（填写后可能触发二次验证）
-                wait_for_turnstile(page, timeout=20000)
-                
-                # 5️⃣ 点击登录按钮
-                print("🔘 点击登录...")
-                login_selectors = [
-                    'button:has-text("登录"):not(:has-text("注册"))',
-                    'button[type="submit"]',
-                    'input[type="submit"]'
-                ]
-                
-                for selector in login_selectors:
-                    try:
-                        btn = page.query_selector(selector)
-                        if btn and btn.is_visible():
-                            btn.click()
-                            print(f"✅ 点击: {selector}")
-                            break
-                    except:
-                        continue
-                
-                # 等待登录成功
+                # 密码（兼容 name="passwd" 和 name="password"）
                 try:
-                    page.wait_for_url(f"{URL}/user*", timeout=30000)
-                    print("✅ 登录成功")
+                    page.fill('input[name="passwd"]', password)
                 except:
-                    # 备用：检查是否出现用户元素
-                    if page.query_selector('a[href="/user/logout"]'):
-                        print("✅ 登录成功（检测到登出链接）")
-                    else:
-                        print("⚠️ 登录响应超时，尝试继续")
+                    page.fill('input[name="password"]', password)
+                
+                # 等待可能的二次验证
+                time.sleep(3)
+                
+                # 4️⃣ 点击登录
+                print("🔘 点击登录...")
+                page.click('button[type="submit"]', timeout=15000)
+                
+                # 5️⃣ 等待登录成功（多种方式）
+                print("⏳ 等待登录响应...")
+                try:
+                    # 方式1: 等待URL跳转
+                    page.wait_for_url(f"{URL}/user*", timeout=20000)
+                    print("✅ 登录成功（URL跳转）")
+                except:
+                    # 方式2: 等待页面出现用户中心元素
+                    try:
+                        page.wait_for_selector('a[href="/user/logout"], #checkin-btn, button:has-text("签到")', timeout=15000)
+                        print("✅ 登录成功（检测到用户元素）")
+                    except:
+                        # 方式3: 再等5秒让页面加载
+                        time.sleep(5)
+                        print("⚠️ 登录响应慢，尝试继续")
                 
                 time.sleep(3)
             
@@ -201,14 +121,13 @@ def sign_account(index, email, password):
             # 7️⃣ 执行签到
             print("📅 执行签到...")
             
-            # 签到按钮（"明日再来"在右上角）
+            # 🔥 签到按钮选择器（使用原生兼容的选择器）
             btn_selectors = [
-                'button:has-text("明日再来")',
-                'a:has-text("明日再来")',
                 '#checkin-btn',
                 '.check-in-btn',
-                'button:has-text("签到")',
-                '.btn-checkin'
+                '.btn-checkin',
+                '[onclick*="checkin"]',
+                '[lay-filter="checkin"]'
             ]
             
             clicked = False
@@ -223,26 +142,46 @@ def sign_account(index, email, password):
                 except:
                     continue
             
-            # JS兜底
+            # 🔥 JS兜底（使用原生兼容的选择器）
             if not clicked:
                 print("🔘 JS触发签到...")
-                page.evaluate("""
-                    () => {
-                        if (typeof checkin === 'function') checkin();
-                        const btn = document.querySelector('#checkin-btn, .check-in-btn, button:has-text("明日再来")');
-                        if (btn) btn.click();
-                    }
-                """)
+                try:
+                    page.evaluate("""
+                        () => {
+                            // 尝试调用SSPANEL原生函数
+                            if (typeof checkin === 'function') {
+                                checkin();
+                                return 'function';
+                            }
+                            // 尝试点击常见ID/class
+                            const ids = ['checkin-btn', 'signin-btn'];
+                            for (let id of ids) {
+                                const el = document.getElementById(id);
+                                if (el) { el.click(); return 'id:' + id; }
+                            }
+                            const classes = ['check-in-btn', 'btn-checkin'];
+                            for (let cls of classes) {
+                                const el = document.querySelector('.' + cls);
+                                if (el) { el.click(); return 'class:' + cls; }
+                            }
+                            return 'not_found';
+                        }
+                    """)
+                    clicked = True
+                except Exception as e:
+                    print(f"⚠️ JS触发失败: {e}")
             
-            # 等待结果
+            # 8️⃣ 等待并提取结果
+            print("⏳ 等待签到结果...")
             time.sleep(6)
             
-            # 提取结果
             msg = None
-            for selector in ['.msg', '.alert', '.layui-layer-content', '[role="alert"]']:
+            
+            # 尝试提取结果消息
+            for selector in ['.msg', '.alert', '.layui-layer-content', '[role="alert"]', '.swal2-html-container']:
                 try:
                     el = page.query_selector(selector)
-                    if el:
+                    if el and el.is_visible():
                         text = el.inner_text().strip()
                         if text and len(text) < 200:
                             msg = text
