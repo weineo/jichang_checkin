@@ -2,7 +2,7 @@ name: "Common airport Checkin"
 
 on:
   schedule:
-    - cron: "40 22 * * *"  # 北京时间每天 06:00
+    - cron: "40 22 * * *"
   workflow_dispatch:
 
 env:
@@ -14,7 +14,7 @@ jobs:
 
     steps:
       - name: Checkout master
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4  # 升级到 v4
 
       - name: Set up python
         uses: actions/setup-python@v5
@@ -25,13 +25,24 @@ jobs:
         if: github.event_name == 'schedule'
         run: sleep $(shuf -i 10-300 -n 1)
 
-      - name: Install dependencies
+      - name: Install system dependencies (for Playwright)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwoff1 libopus0 libwebp7 libwebpdemux2 libenchant-2-2 \
+            libgudev-1.0-0 libsecret-1-0 libhyphen0 libgdk-pixbuf2.0-0 \
+            libegl1 libnotify4 libxslt1.1 libevent-2.1-7 libgles2 \
+            libxcomposite1 libatk1.0-0 libatk-bridge2.0-0 libdrm2 libxkbcommon0 \
+            libatspi2.0-0 libx11-xcb1 libxcb1 libxrandr2 libgbm1 libasound2
+
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt || echo "requirements.txt 不存在，跳过"
-          # 🌟 安装 curl_cffi（当前绕过 CF 最稳的 Python 库）
-          pip install curl_cffi
-          python -c "from curl_cffi import requests; print('✅ curl_cffi 安装成功')"
+          pip install playwright requests
+          # 安装 Chromium 浏览器（Playwright 核心）
+          python -m playwright install chromium
+          python -m playwright install-deps chromium  # 安装系统依赖
+          python -c "from playwright.sync_api import sync_playwright; print('✅ Playwright 就绪')"
 
       - name: Run sign
         env:
@@ -41,3 +52,12 @@ jobs:
           PASSWD: ${{ secrets.PASSWD }}
           CONFIG: ${{ secrets.CONFIG }}
         run: python3 ./main.py
+
+      # 可选：上传错误截图方便调试
+      - name: Upload error screenshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots
+          path: error_*.png
+          retention-days: 3
