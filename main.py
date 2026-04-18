@@ -38,6 +38,45 @@ def push_notification(title, content):
     except:
         pass
 
+def wait_for_turnstile(page, timeout=40000):
+    """等待Cloudflare Turnstile验证完成"""
+    print("🔄 检测Turnstile验证...")
+    
+    # 检查是否有Turnstile iframe
+    if not page.query_selector('iframe[src*="challenges.cloudflare.com"]'):
+        print("ℹ️  未检测到Turnstile，跳过")
+        return True
+    
+    start = time.time()
+    while time.time() - start < timeout / 1000:
+        try:
+            # 方法1: 检查token是否生成
+            token = page.evaluate("""
+                () => {
+                    const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+                    if (!iframe) return null;
+                    try {
+                        return iframe.contentWindow?.document.querySelector('input[name="cf-turnstile-response"]')?.value;
+                    } catch { return null; }
+                }
+            """)
+            if token and len(token) > 20:
+                print("✅ Turnstile验证通过（检测到token）")
+                return True
+        except:
+            pass
+        
+        # 方法2: 检查iframe是否消失
+        if not page.query_selector('iframe[src*="challenges.cloudflare.com"]'):
+            print("✅ Turnstile验证通过（iframe已消失）")
+            return True
+        
+        print(f"⏳ 等待Turnstile... ({int(time.time()-start)}s)")
+        time.sleep(3)
+    
+    print("⚠️ Turnstile等待超时，尝试继续")
+    return False
+
 def sign_account(index, email, password):
     print(f"\n{'='*20} 账号 {index+1} {'='*20}")
     print(f"👤 账号: {email}")
@@ -69,119 +108,107 @@ def sign_account(index, email, password):
             # 1️⃣ 访问主页
             print(f"🏠 访问主页...")
             page.goto(URL, wait_until='networkidle', timeout=60000)
-            time.sleep(8)  # 等待CF验证
+            time.sleep(5)  # 初始等待
             
-            # 检查CF
-            for i in range(5):
-                html = page.content().lower()
-                if 'cloudflare' not in html:
-                    break
-                print(f"⏳ 等待CF... ({i+1}/5)")
-                time.sleep(5)
+            # 2️⃣ 等待Turnstile验证（关键！）
+            wait_for_turnstile(page)
+            time.sleep(2)  # 验证后稍等
             
-            # 🔍 关键：检查主页是否已是登录页
-            page_title = page.title().lower()
-            has_email_input = page.query_selector('input[name="email"], input[type="email"]')
-            has_password_input = page.query_selector('input[name="passwd"], input[type="password"]')
-            
-            if has_email_input and has_password_input:
-                print("✅ 主页已是登录页，直接登录")
-                # 不点击任何链接，直接在当前页登录
-            elif '/user' in page.url:
-                print("✅ 主页已是用户中心")
-            else:
-                # 寻找登录入口
-                print("🔍 寻找登录入口...")
-                # 点击"登录"链接（不是"注册"）
-                try:
-                    page.click('a:has-text("登录"), a:has-text("Login")', timeout=10000)
-                    page.wait_for_load_state('networkidle')
-                    time.sleep(3)
-                except:
-                    page.goto(f"{URL}/auth/login", wait_until='domcontentloaded', timeout=20000)
-                    time.sleep(3)
-            
-            # 2️⃣ 检查是否已登录
+            # 3️⃣ 检查是否已登录
             if '/user' in page.url:
-                print("✅ 已登录")
+                print("✅ 已是用户中心")
             else:
-                # 3️⃣ 填写登录表单
+                # 4️⃣ 填写登录表单
                 print("📝 填写登录信息...")
                 
-                # 等待输入框
-                page.wait_for_selector('input[name="email"]', timeout=15000)
-                page.fill('input[name="email"]', email)
-                page.fill('input[name="passwd"]', password)
+                # 🔥 使用更灵活的选择器（兼容多种写法）
+                email_selectors = ['input[name="email"]', 'input[type="email"]', '#email']
+                pwd_selectors = ['input[name="passwd"]', 'input[name="password"]', 'input[type="password"]', '#password']
                 
-                # 🔥 等待Turnstile验证（"点我开始验证"）
-                print("🔄 等待Turnstile验证...")
-                
-                # 检查是否有Turnstile iframe
-                if page.query_selector('iframe[src*="challenges.cloudflare.com"]'):
+                # 等待并填写邮箱
+                email_filled = False
+                for selector in email_selectors:
                     try:
-                        # 等待验证完成（最多30秒）
-                        page.wait_for_function("""
-                            () => {
-                                const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-                                if (!iframe) return true;
-                                const token = iframe.contentWindow?.document.querySelector('input[name="cf-turnstile-response"]')?.value;
-                                return token && token.length > 20;
-                            }
-                        """, timeout=30000)
-                        print("✅ Turnstile验证通过")
+                        el = page.wait_for_selector(selector, state='visible', timeout=10000)
+                        el.fill(email)
+                        print(f"✅ 填写邮箱: {selector}")
+                        email_filled = True
+                        break
                     except:
-                        print("⚠️ Turnstile超时，尝试继续")
-                        time.sleep(5)
-                else:
-                    # 没有Turnstile，等待3秒
-                    time.sleep(3)
+                        continue
                 
-                # 4️⃣ 点击登录按钮
+                if not email_filled:
+                    print("❌ 未找到邮箱输入框")
+                    result_msg = f"账号 {email}: ❌ 未找到邮箱输入框"
+                    return result_msg
+                
+                # 等待并填写密码
+                pwd_filled = False
+                for selector in pwd_selectors:
+                    try:
+                        el = page.wait_for_selector(selector, state='visible', timeout=10000)
+                        el.fill(password)
+                        print(f"✅ 填写密码: {selector}")
+                        pwd_filled = True
+                        break
+                    except:
+                        continue
+                
+                if not pwd_filled:
+                    print("❌ 未找到密码输入框")
+                    result_msg = f"账号 {email}: ❌ 未找到密码输入框"
+                    return result_msg
+                
+                # 🔥 再次等待Turnstile（填写后可能触发二次验证）
+                wait_for_turnstile(page, timeout=20000)
+                
+                # 5️⃣ 点击登录按钮
                 print("🔘 点击登录...")
-                
-                # 查找登录按钮（排除注册按钮）
-                login_btn_selectors = [
+                login_selectors = [
                     'button:has-text("登录"):not(:has-text("注册"))',
-                    'button[type="submit"]:not(button:has-text("注册"))',
+                    'button[type="submit"]',
                     'input[type="submit"]'
                 ]
                 
-                for selector in login_btn_selectors:
+                for selector in login_selectors:
                     try:
                         btn = page.query_selector(selector)
                         if btn and btn.is_visible():
                             btn.click()
-                            print(f"✅ 点击登录按钮")
+                            print(f"✅ 点击: {selector}")
                             break
                     except:
                         continue
                 
                 # 等待登录成功
-                page.wait_for_url(f"{URL}/user*", timeout=30000)
-                print("✅ 登录成功")
+                try:
+                    page.wait_for_url(f"{URL}/user*", timeout=30000)
+                    print("✅ 登录成功")
+                except:
+                    # 备用：检查是否出现用户元素
+                    if page.query_selector('a[href="/user/logout"]'):
+                        print("✅ 登录成功（检测到登出链接）")
+                    else:
+                        print("⚠️ 登录响应超时，尝试继续")
+                
                 time.sleep(3)
             
-            # 5️⃣ 访问用户中心
+            # 6️⃣ 确保在用户中心
             if '/user' not in page.url:
                 page.goto(f"{URL}/user", wait_until='networkidle', timeout=30000)
-                time.sleep(5)
+                time.sleep(4)
             
-            # 检查404
-            if '404' in page.title():
-                print("❌ 用户中心404")
-                result_msg = f"账号 {email}: ❌ 404"
-                return result_msg
-            
-            # 6️⃣ 签到
+            # 7️⃣ 执行签到
             print("📅 执行签到...")
             
-            # 查找签到按钮（"明日再来"）
+            # 签到按钮（"明日再来"在右上角）
             btn_selectors = [
                 'button:has-text("明日再来")',
                 'a:has-text("明日再来")',
                 '#checkin-btn',
                 '.check-in-btn',
-                'button:has-text("签到")'
+                'button:has-text("签到")',
+                '.btn-checkin'
             ]
             
             clicked = False
@@ -196,35 +223,39 @@ def sign_account(index, email, password):
                 except:
                     continue
             
+            # JS兜底
             if not clicked:
-                print("🔘 JS触发...")
+                print("🔘 JS触发签到...")
                 page.evaluate("""
                     () => {
                         if (typeof checkin === 'function') checkin();
-                        const btn = document.querySelector('#checkin-btn, .check-in-btn');
+                        const btn = document.querySelector('#checkin-btn, .check-in-btn, button:has-text("明日再来")');
                         if (btn) btn.click();
                     }
                 """)
             
+            # 等待结果
             time.sleep(6)
             
             # 提取结果
             msg = None
-            for selector in ['.msg', '.alert', '.layui-layer-content']:
+            for selector in ['.msg', '.alert', '.layui-layer-content', '[role="alert"]']:
                 try:
                     el = page.query_selector(selector)
                     if el:
-                        msg = el.inner_text().strip()
-                        if msg:
+                        text = el.inner_text().strip()
+                        if text and len(text) < 200:
+                            msg = text
                             break
                 except:
                     continue
             
+            # 检查页面文本
             if not msg:
                 page_text = page.text_content('body')
-                if '已签到' in page_text or '签到成功' in page_text:
+                if '签到成功' in page_text or '获得' in page_text:
                     msg = "✅ 签到成功"
-                elif '今日已签到' in page_text:
+                elif '今日已签到' in page_text or '明日再来' in page_text:
                     msg = "ℹ️ 今日已签到"
             
             if msg:
