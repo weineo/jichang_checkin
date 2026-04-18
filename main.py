@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import json
 import os
 import time
 import random
@@ -17,7 +16,7 @@ def get_accounts():
     if CONFIG.strip():
         lines = [line.strip() for line in CONFIG.strip().splitlines() if line.strip()]
         if len(lines) % 2 != 0:
-            print("⚠️ CONFIG 格式错误")
+            print("⚠️ CONFIG格式错误")
             return []
         for i in range(0, len(lines), 2):
             accounts.append((lines[i], lines[i+1]))
@@ -32,18 +31,16 @@ def push_notification(title, content):
         return
     try:
         import requests
-        # Server酱免费额度每天5次，超限会返回400
         res = requests.post(f"https://sctapi.ftqq.com/{SCKEY}.send", 
-                          data={"title": title, "desp": content}, 
-                          timeout=10)
+                          data={"title": title, "desp": content}, timeout=10)
         if res.status_code == 200:
             print("📤 推送成功")
-        elif res.status_code == 400 and '发送次数限制' in res.text:
-            print("⚠️ Server酱今日推送已达上限（免费5次/天）")
+        elif '发送次数限制' in res.text:
+            print("⚠️ Server酱今日推送已达上限")
         else:
             print(f"⚠️ 推送失败: {res.status_code}")
-    except Exception as e:
-        print(f"⚠️ 推送异常: {e}")
+    except:
+        pass
 
 def sign_account_playwright(index, email, password):
     print(f"\n{'='*20} 账号 {index+1} {'='*20}")
@@ -55,8 +52,8 @@ def sign_account_playwright(index, email, password):
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', 
-                  '--disable-gpu', '--no-first-run', '--no-zygote', 
+            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
+                  '--disable-gpu', '--no-first-run', '--no-zygote',
                   '--disable-blink-features=AutomationControlled']
         )
         
@@ -67,10 +64,11 @@ def sign_account_playwright(index, email, password):
             timezone_id='Asia/Shanghai'
         )
         
+        # 屏蔽自动化检测
         context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
-            Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3] });
+            Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN','zh','en'] });
         """)
         
         page = context.new_page()
@@ -78,29 +76,27 @@ def sign_account_playwright(index, email, password):
         try:
             # 1. 访问主页触发CF验证
             print(f"🏠 访问主页: {URL}")
-            page.goto(URL, wait_until='networkidle', timeout=30000)
-            time.sleep(4)  # 等待CF验证
+            page.goto(URL, wait_until='networkidle', timeout=40000)
+            time.sleep(5)  # 关键：等待CF验证完成
             
             # 2. 跳转到登录页
             login_url = f"{URL}/auth/login"
-            print(f"🔑 访问登录页")
+            print("🔑 访问登录页")
             
-            # 尝试点击登录链接
             if page.query_selector('a[href="/auth/login"]'):
                 page.click('a[href="/auth/login"]')
                 page.wait_for_load_state('networkidle')
             else:
-                page.goto(login_url, wait_until='domcontentloaded', timeout=20000)
-            
-            time.sleep(2)
+                page.goto(login_url, wait_until='domcontentloaded', timeout=25000)
+            time.sleep(3)
             
             # 3. 检查是否已登录
             if '/user' in page.url or page.query_selector('a[href="/user/logout"]'):
-                print("✅ 已登录，跳过登录步骤")
+                print("✅ 已登录，跳过登录")
             else:
                 # 填写表单
-                email_input = page.wait_for_selector('input[name="email"], input[type="email"]', state='visible', timeout=10000)
-                email_input.fill(email)
+                print("📝 填写登录信息")
+                page.fill('input[name="email"], input[type="email"]', email)
                 page.fill('input[name="passwd"], input[type="password"]', password)
                 
                 # 等待Turnstile
@@ -114,90 +110,115 @@ def sign_account_playwright(index, email, password):
                                 const token = iframe.contentWindow?.document.querySelector('input[name="cf-turnstile-response"]')?.value;
                                 return token && token.length > 20;
                             }
-                        """, timeout=25000)
+                        """, timeout=30000)
                         print("✅ Turnstile通过")
                     except:
-                        print("⚠️ Turnstile超时")
+                        print("⚠️ Turnstile超时，尝试继续")
                 
                 # 点击登录
-                page.click('button[type="submit"], input[type="submit"]', timeout=10000)
-                page.wait_for_url(f"{URL}/user*", timeout=20000)
+                page.click('button[type="submit"], input[type="submit"]', timeout=15000)
+                page.wait_for_url(f"{URL}/user*", timeout=25000)
                 print("✅ 登录成功")
             
-            # 4. 🔥 签到核心逻辑（多方案尝试）
-            time.sleep(2)
+            # 4. 🔥 浏览器内执行签到（关键修改！）
+            time.sleep(3)
             print("📅 执行签到...")
             
-            cookies = context.cookies()
-            cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
-            
-            import requests
-            session = requests.Session()
-            session.headers.update({
-                'user-agent': user_agent,
-                'origin': URL,
-                'referer': f"{URL}/user",
-                'cookie': cookie_str,
-                'x-requested-with': 'XMLHttpRequest',  # SSPANEL关键头
-                'accept': 'application/json, text/javascript, */*; q=0.01'
-            })
-            
-            # 🔄 方案A: 标准 /user/checkin 接口
-            checkin_url = f"{URL}/user/checkin"
-            print(f"🔹 尝试接口: {checkin_url}")
-            res = session.post(checkin_url, timeout=15)
-            
-            if res.text.strip().startswith('{'):
-                try:
-                    data = res.json()
-                    msg = data.get('msg', data.get('message', '签到完成'))
-                    print(f"🎉 签到成功: {msg}")
-                    result_msg = f"账号 {email}: {msg}"
-                except json.JSONDecodeError:
-                    pass
-            
-            # 🔄 方案B: 备用接口 /user?action=checkin
-            if not result_msg:
-                print(f"🔹 尝试备用接口: {URL}/user")
-                res2 = session.post(f"{URL}/user", data={'action': 'checkin'}, timeout=15)
-                if res2.text.strip().startswith('{'):
-                    try:
-                        data = res2.json()
-                        msg = data.get('msg', data.get('message', '签到完成'))
-                        print(f"🎉 签到成功: {msg}")
-                        result_msg = f"账号 {email}: {msg}"
-                    except:
-                        pass
-            
-            # 🔄 方案C: 页面点击签到按钮（最后手段）
-            if not result_msg:
-                print("🔹 尝试页面点击签到...")
-                page.goto(f"{URL}/user", wait_until='domcontentloaded', timeout=15000)
+            # 确保在用户中心页面
+            if '/user' not in page.url:
+                page.goto(f"{URL}/user", wait_until='networkidle', timeout=20000)
                 time.sleep(3)
-                
-                # 查找签到按钮
-                btn = page.query_selector('#checkin-btn, .check-in-btn, button:has-text("签到"), button:has-text("Check In")')
-                if btn:
-                    btn.click()
-                    page.wait_for_load_state('networkidle')
-                    # 提取结果
-                    msg_el = page.query_selector('.msg, .alert, .layui-layer-content')
-                    msg = msg_el.inner_text().strip() if msg_el else "签到请求已发送"
-                    print(f"🎉 签到结果: {msg}")
-                    result_msg = f"账号 {email}: {msg}"
-                else:
-                    # 检查是否已签到
-                    if page.query_selector('text=今日已签到, text=Already checked in, text=您已签到'):
-                        result_msg = f"账号 {email}: ✅ 今日已签到"
-                        print("ℹ️  今日已签到")
-                    else:
-                        # 打印响应调试
-                        print(f"⚠️ 签到响应预览: {res.text[:300]}")
-                        result_msg = f"账号 {email}: ❌ 签到失败（接口返回非预期内容）"
+            
+            # 查找并点击签到按钮（多种选择器兼容）
+            checkin_selectors = [
+                '#checkin-btn',
+                '.check-in-btn', 
+                'button:has-text("签到")',
+                'button:has-text("Check In")',
+                'button:has-text("checkin")',
+                '.layui-btn[lay-filter="checkin"]',
+                'a:has-text("签到")'
+            ]
+            
+            clicked = False
+            for selector in checkin_selectors:
+                try:
+                    btn = page.query_selector(selector)
+                    if btn and btn.is_visible():
+                        print(f"🔘 点击签到按钮: {selector}")
+                        btn.click()
+                        clicked = True
+                        break
+                except:
+                    continue
+            
+            if not clicked:
+                # 尝试JS直接触发签到事件（SSPANEL常见）
+                print("🔘 尝试JS触发签到...")
+                result = page.evaluate("""
+                    () => {
+                        // 尝试直接调用SSPANEL的签到函数
+                        if (typeof checkin === 'function') {
+                            checkin();
+                            return 'function_called';
+                        }
+                        // 尝试触发按钮点击事件
+                        const btn = document.querySelector('#checkin-btn, .check-in-btn');
+                        if (btn) {
+                            btn.click();
+                            return 'button_clicked';
+                        }
+                        return 'not_found';
+                    }
+                """)
+                print(f"🔘 JS执行结果: {result}")
+            
+            # 5. 等待签到结果
+            print("⏳ 等待签到响应...")
+            time.sleep(4)
+            
+            # 提取结果消息（多种可能位置）
+            msg_selectors = [
+                '.msg', '.alert', '.alert-success', '.layui-layer-content',
+                '[role="alert"]', '.swal2-html-container', '#result'
+            ]
+            
+            msg = None
+            for selector in msg_selectors:
+                try:
+                    el = page.query_selector(selector)
+                    if el and el.is_visible():
+                        text = el.inner_text().strip()
+                        if text and len(text) < 200:  # 过滤过长内容
+                            msg = text
+                            break
+                except:
+                    continue
+            
+            # 备用：检查页面是否显示已签到
+            if not msg:
+                page_text = page.text_content('body').lower()
+                if '已签到' in page_text or 'already checked' in page_text or '今日奖励' in page_text:
+                    msg = "✅ 签到成功（检测到页面提示）"
+            
+            # 最终结果
+            if msg:
+                print(f"🎉 签到结果: {msg}")
+                result_msg = f"账号 {email}: {msg}"
+            else:
+                # 保存调试信息
+                timestamp = int(time.time())
+                page.screenshot(path=f'checkin_debug_{timestamp}.png')
+                print("📸 已保存签到页截图用于调试")
+                result_msg = f"账号 {email}: ❓ 未检测到签到结果（请查看artifact截图）"
                     
         except Exception as e:
             print(f"💥 异常: {str(e)}")
             result_msg = f"账号 {email}: {str(e)[:100]}"
+            try:
+                page.screenshot(path=f'error_{int(time.time())}.png')
+            except:
+                pass
         finally:
             browser.close()
     
@@ -218,7 +239,7 @@ if __name__ == '__main__':
     for idx, (email, pwd) in enumerate(accounts):
         results.append(sign_account_playwright(idx, email, pwd))
         if idx < len(accounts) - 1:
-            time.sleep(random.randint(20, 40))
+            time.sleep(random.randint(25, 50))  # 多账号间隔更长
     
     if SCKEY and results:
         summary = "📊 iKuuu签到汇总\n\n" + "\n\n".join(results)
