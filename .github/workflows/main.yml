@@ -2,7 +2,7 @@ name: "Common airport Checkin"
 
 on:
   schedule:
-    - cron: "40 22 * * *"  # 北京时间 06:00
+    - cron: "40 22 * * *"  # 北京时间每天 06:00
   workflow_dispatch:
 
 env:
@@ -14,33 +14,33 @@ jobs:
 
     steps:
       - name: Checkout master
-        uses: actions/checkout@v2
-        with:
-          fetch-depth: 0
+        uses: actions/checkout@v3
 
       - name: Set up python
         uses: actions/setup-python@v5
         with:
-          python-version: 3.10.16
+          python-version: '3.10'
 
-      - name: Random sleep  # 防封关键！保留
+      - name: Random sleep
         if: github.event_name == 'schedule'
         run: sleep $(shuf -i 10-300 -n 1)
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          # 备用方案：用国内镜像 + 指定版本
-          pip install --index-url https://pypi.tuna.tsinghua.edu.cn/simple cloudscraper==1.2.71
+          # 安装基础依赖（忽略失败防止阻塞）
+          pip install -r requirements.txt || echo "requirements.txt not found, skipping."
+          # 强制安装 cloudscraper
+          echo "📦 Installing cloudscraper..."
+          pip install cloudscraper
+          # 验证是否安装成功
+          python -c "import cloudscraper; print('✅ cloudscraper 安装成功，版本:', cloudscraper.__version__)"
 
       - name: Run sign
         env:
           URL: ${{ secrets.URL }}
           SCKEY: ${{ secrets.SCKEY }}
-          CONFIG: ${{ secrets.CONFIG }}  # ✅ 确保已配置此 Secret
-          # 以下两个如不用可注释：
-          # EMAIL: ${{ secrets.EMAIL }}
-          # PASSWD: ${{ secrets.PASSWD }}
-        run: |
-          python3 ./main.py
+          EMAIL: ${{ secrets.EMAIL }}
+          PASSWD: ${{ secrets.PASSWD }}
+          CONFIG: ${{ secrets.CONFIG }}
+        run: python3 ./main.py
