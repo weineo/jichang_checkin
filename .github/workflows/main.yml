@@ -28,13 +28,10 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # 安装基础依赖（忽略失败防止阻塞）
-          pip install -r requirements.txt || echo "requirements.txt not found, skipping."
-          # 强制安装 cloudscraper
-          echo "📦 Installing cloudscraper..."
-          pip install cloudscraper
-          # 验证是否安装成功
-          python -c "import cloudscraper; print('✅ cloudscraper 安装成功，版本:', cloudscraper.__version__)"
+          pip install -r requirements.txt || echo "requirements.txt 不存在，跳过"
+          # 🌟 安装 curl_cffi（当前绕过 CF 最稳的 Python 库）
+          pip install curl_cffi
+          python -c "from curl_cffi import requests; print('✅ curl_cffi 安装成功')"
 
       - name: Run sign
         env:
