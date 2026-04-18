@@ -3,7 +3,7 @@
 import os
 import time
 import random
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+from playwright.sync_api import sync_playwright
 
 URL = os.environ.get('URL', '').rstrip('/')
 SCKEY = os.environ.get('SCKEY', '')
@@ -36,25 +36,22 @@ def push_notification(title, content):
         if res.status_code == 200:
             print("📤 推送成功")
         elif '发送次数限制' in res.text:
-            print("⚠️ Server酱今日推送已达上限")
-        else:
-            print(f"⚠️ 推送失败: {res.status_code}")
+            print("⚠️ Server酱今日已达上限")
     except:
         pass
 
-def sign_account_playwright(index, email, password):
+def sign_account(index, email, password):
     print(f"\n{'='*20} 账号 {index+1} {'='*20}")
     print(f"👤 账号: {email}")
     
     result_msg = ""
-    user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+    user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
     
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
             args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
-                  '--disable-gpu', '--no-first-run', '--no-zygote',
-                  '--disable-blink-features=AutomationControlled']
+                  '--disable-gpu', '--no-first-run', '--disable-blink-features=AutomationControlled']
         )
         
         context = browser.new_context(
@@ -64,157 +61,134 @@ def sign_account_playwright(index, email, password):
             timezone_id='Asia/Shanghai'
         )
         
-        # 屏蔽自动化检测
         context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3] });
-            Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN','zh','en'] });
         """)
         
         page = context.new_page()
         
         try:
-            # 1. 访问主页触发CF验证
-            print(f"🏠 访问主页: {URL}")
+            # 1️⃣ 访问主页（触发CF验证）
+            print(f"🏠 访问主页...")
             page.goto(URL, wait_until='networkidle', timeout=40000)
-            time.sleep(5)  # 关键：等待CF验证完成
+            time.sleep(8)  # ️ 关键：等待CF验证完成（8秒）
             
-            # 2. 跳转到登录页
-            login_url = f"{URL}/auth/login"
-            print("🔑 访问登录页")
+            # 2️⃣ 直接访问用户中心
+            print("🔑 访问用户中心...")
+            page.goto(f"{URL}/user", wait_until='networkidle', timeout=30000)
+            time.sleep(5)  # 等待页面加载
             
-            if page.query_selector('a[href="/auth/login"]'):
-                page.click('a[href="/auth/login"]')
-                page.wait_for_load_state('networkidle')
-            else:
-                page.goto(login_url, wait_until='domcontentloaded', timeout=25000)
-            time.sleep(3)
+            # 检查是否404
+            if '404' in page.title():
+                print("❌ 用户中心返回404")
+                page.screenshot(path=f'error_{int(time.time())}.png')
+                result_msg = f"账号 {email}: ❌ 无法访问用户中心"
+                return result_msg
             
-            # 3. 检查是否已登录
-            if '/user' in page.url or page.query_selector('a[href="/user/logout"]'):
-                print("✅ 已登录，跳过登录")
-            else:
+            # 3️⃣ 检查是否需要登录
+            if '/auth/login' in page.url or '登录' in page.title():
+                print("📝 需要登录，寻找登录表单...")
+                
+                # 尝试点击登录链接
+                try:
+                    page.click('a:has-text("登录"), a:has-text("Login")', timeout=10000)
+                    page.wait_for_load_state('networkidle')
+                    time.sleep(3)
+                except:
+                    pass
+                
                 # 填写表单
-                print("📝 填写登录信息")
-                page.fill('input[name="email"], input[type="email"]', email)
-                page.fill('input[name="passwd"], input[type="password"]', password)
-                
-                # 等待Turnstile
-                if page.query_selector('iframe[src*="challenges.cloudflare.com"]'):
-                    print("🔄 等待Turnstile验证...")
-                    try:
-                        page.wait_for_function("""
-                            () => {
-                                const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-                                if (!iframe) return true;
-                                const token = iframe.contentWindow?.document.querySelector('input[name="cf-turnstile-response"]')?.value;
-                                return token && token.length > 20;
-                            }
-                        """, timeout=30000)
-                        print("✅ Turnstile通过")
-                    except:
-                        print("⚠️ Turnstile超时，尝试继续")
-                
-                # 点击登录
-                page.click('button[type="submit"], input[type="submit"]', timeout=15000)
-                page.wait_for_url(f"{URL}/user*", timeout=25000)
-                print("✅ 登录成功")
+                try:
+                    page.fill('input[name="email"], input[type="email"]', email)
+                    page.fill('input[name="passwd"], input[type="password"]', password)
+                    
+                    # 等待Turnstile
+                    if page.query_selector('iframe[src*="challenges.cloudflare.com"]'):
+                        print("🔄 等待验证...")
+                        time.sleep(10)
+                    
+                    # 点击登录
+                    page.click('button[type="submit"]', timeout=15000)
+                    page.wait_for_url(f"{URL}/user*", timeout=30000)
+                    print("✅ 登录成功")
+                    time.sleep(3)
+                except Exception as e:
+                    print(f"❌ 登录失败: {e}")
+                    result_msg = f"账号 {email}: ❌ 登录失败"
+                    return result_msg
             
-            # 4. 🔥 浏览器内执行签到（关键修改！）
-            time.sleep(3)
+            # 4️⃣ 执行签到
             print("📅 执行签到...")
             
-            # 确保在用户中心页面
-            if '/user' not in page.url:
-                page.goto(f"{URL}/user", wait_until='networkidle', timeout=20000)
-                time.sleep(3)
-            
-            # 查找并点击签到按钮（多种选择器兼容）
-            checkin_selectors = [
+            # 查找签到按钮（覆盖所有可能）
+            btn_selectors = [
                 '#checkin-btn',
-                '.check-in-btn', 
+                '.check-in-btn',
                 'button:has-text("签到")',
                 'button:has-text("Check In")',
-                'button:has-text("checkin")',
                 '.layui-btn[lay-filter="checkin"]',
-                'a:has-text("签到")'
+                'a:has-text("签到")',
+                '.btn-checkin'
             ]
             
             clicked = False
-            for selector in checkin_selectors:
+            for selector in btn_selectors:
                 try:
                     btn = page.query_selector(selector)
                     if btn and btn.is_visible():
-                        print(f"🔘 点击签到按钮: {selector}")
+                        print(f"🔘 点击: {selector}")
                         btn.click()
                         clicked = True
                         break
                 except:
                     continue
             
+            # JS兜底
             if not clicked:
-                # 尝试JS直接触发签到事件（SSPANEL常见）
-                print("🔘 尝试JS触发签到...")
-                result = page.evaluate("""
+                print("🔘 JS触发签到...")
+                page.evaluate("""
                     () => {
-                        // 尝试直接调用SSPANEL的签到函数
-                        if (typeof checkin === 'function') {
-                            checkin();
-                            return 'function_called';
-                        }
-                        // 尝试触发按钮点击事件
+                        if (typeof checkin === 'function') checkin();
                         const btn = document.querySelector('#checkin-btn, .check-in-btn');
-                        if (btn) {
-                            btn.click();
-                            return 'button_clicked';
-                        }
-                        return 'not_found';
+                        if (btn) btn.click();
                     }
                 """)
-                print(f"🔘 JS执行结果: {result}")
             
-            # 5. 等待签到结果
-            print("⏳ 等待签到响应...")
-            time.sleep(4)
+            # 等待结果
+            time.sleep(5)
             
-            # 提取结果消息（多种可能位置）
-            msg_selectors = [
-                '.msg', '.alert', '.alert-success', '.layui-layer-content',
-                '[role="alert"]', '.swal2-html-container', '#result'
-            ]
-            
+            # 提取结果
             msg = None
-            for selector in msg_selectors:
+            for selector in ['.msg', '.alert', '.layui-layer-content', '[role="alert"]']:
                 try:
                     el = page.query_selector(selector)
-                    if el and el.is_visible():
+                    if el:
                         text = el.inner_text().strip()
-                        if text and len(text) < 200:  # 过滤过长内容
+                        if text and len(text) < 200:
                             msg = text
                             break
                 except:
                     continue
             
-            # 备用：检查页面是否显示已签到
+            # 检查页面文本
             if not msg:
-                page_text = page.text_content('body').lower()
-                if '已签到' in page_text or 'already checked' in page_text or '今日奖励' in page_text:
-                    msg = "✅ 签到成功（检测到页面提示）"
+                page_text = page.text_content('body')
+                if '已签到' in page_text or '今日奖励' in page_text:
+                    msg = "✅ 签到成功"
+                elif '今日已签到' in page_text:
+                    msg = "ℹ️ 今日已签到"
             
-            # 最终结果
             if msg:
-                print(f"🎉 签到结果: {msg}")
+                print(f"🎉 结果: {msg}")
                 result_msg = f"账号 {email}: {msg}"
             else:
-                # 保存调试信息
-                timestamp = int(time.time())
-                page.screenshot(path=f'checkin_debug_{timestamp}.png')
-                print("📸 已保存签到页截图用于调试")
-                result_msg = f"账号 {email}: ❓ 未检测到签到结果（请查看artifact截图）"
+                print("⚠️ 未检测到结果")
+                page.screenshot(path=f'result_{int(time.time())}.png')
+                result_msg = f"账号 {email}: ❓ 未检测到结果"
                     
         except Exception as e:
-            print(f"💥 异常: {str(e)}")
-            result_msg = f"账号 {email}: {str(e)[:100]}"
+            print(f"💥 异常: {e}")
+            result_msg = f"账号 {email}: {str(e)[:80]}"
             try:
                 page.screenshot(path=f'error_{int(time.time())}.png')
             except:
@@ -237,12 +211,12 @@ if __name__ == '__main__':
     results = []
     
     for idx, (email, pwd) in enumerate(accounts):
-        results.append(sign_account_playwright(idx, email, pwd))
+        results.append(sign_account(idx, email, pwd))
         if idx < len(accounts) - 1:
-            time.sleep(random.randint(25, 50))  # 多账号间隔更长
+            time.sleep(random.randint(30, 60))
     
     if SCKEY and results:
-        summary = "📊 iKuuu签到汇总\n\n" + "\n\n".join(results)
+        summary = "📊 iKuuu签到\n\n" + "\n\n".join(results)
         push_notification("机场签到", summary)
     
     print("\n🏁 完成")
