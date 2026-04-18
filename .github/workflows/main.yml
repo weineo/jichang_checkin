@@ -2,7 +2,7 @@ name: "Common airport Checkin"
 
 on:
   schedule:
-    - cron: "40 22 * * *"  # scheduled at 06:00 (UTC+8) everyday
+    - cron: "40 22 * * *"  # 北京时间 06:00
   workflow_dispatch:
 
 env:
@@ -11,34 +11,35 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # if: github.ref == 'refs/heads/master'
 
     steps:
       - name: Checkout master
         uses: actions/checkout@v2
         with:
           fetch-depth: 0
-          # ref: master
 
       - name: Set up python
         uses: actions/setup-python@v5
         with:
           python-version: 3.10.16
 
-      - name: Random sleep
+      - name: Random sleep  # 防封关键！保留
         if: github.event_name == 'schedule'
         run: sleep $(shuf -i 10-300 -n 1)
 
-      - name: Install dependencies
+      - name: Install dependencies  # ✅ 仅修改此处
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install git+https://github.com/VeNoMouS/cloudscraper.git
+
       - name: Run sign
         env:
           URL: ${{ secrets.URL }}
           SCKEY: ${{ secrets.SCKEY }}
-          EMAIL: ${{ secrets.EMAIL }}
-          PASSWD: ${{ secrets.PASSWD }}
-          CONFIG: ${{ secrets.CONFIG }}
+          CONFIG: ${{ secrets.CONFIG }}  # ✅ 确保已配置此 Secret
+          # 以下两个如不用可注释：
+          # EMAIL: ${{ secrets.EMAIL }}
+          # PASSWD: ${{ secrets.PASSWD }}
         run: |
           python3 ./main.py
