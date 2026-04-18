@@ -39,17 +39,18 @@ jobs:
         env:
           URL: ${{ secrets.URL }}
           SCKEY: ${{ secrets.SCKEY }}
-          EMAIL: ${{ secrets.EMAIL }}
-          PASSWD: ${{ secrets.PASSWD }}
           CONFIG: ${{ secrets.CONFIG }}
         run: python3 ./main.py
 
-      # 可选：失败时上传截图方便调试
-      - name: Upload error screenshots
-        if: failure()
+      # ✅ 关键：无论成功失败都上传调试文件（成功时文件不存在会跳过）
+      - name: Upload debug files
+        if: always()  # 即使成功也尝试上传（失败时才有文件）
         uses: actions/upload-artifact@v4
         with:
-          name: debug-screenshots
-          path: error_*.png
+          name: debug-output-${{ github.run_number }}
+          path: |
+            debug_*.png
+            debug_*.html
           retention-days: 3
           overwrite: true
+          if-no-files-found: ignore  # 没有调试文件时不报错
