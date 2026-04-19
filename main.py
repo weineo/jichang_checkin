@@ -38,6 +38,49 @@ def push_notification(title, content):
     except:
         pass
 
+def close_popup(page):
+    """关闭可能的弹窗通知"""
+    try:
+        # 查找弹窗（根据截图：重要通知弹窗）
+        popup_selectors = [
+            'button:has-text("Read")',
+            'button:has-text("不再提醒")',
+            '.swal2-confirm',
+            '.layui-layer-btn0',
+            '[class*="modal"] button[class*="confirm"]'
+        ]
+        
+        for selector in popup_selectors:
+            try:
+                btn = page.query_selector(selector)
+                if btn and btn.is_visible():
+                    print(f"🔘 关闭弹窗: {selector}")
+                    btn.click()
+                    time.sleep(1)  # 等待弹窗关闭
+                    return True
+            except:
+                continue
+        
+        # 备用：JS关闭常见弹窗
+        page.evaluate("""
+            () => {
+                // 关闭SweetAlert
+                if (typeof Swal !== 'undefined') Swal.close();
+                // 关闭Layui弹窗
+                if (typeof layer !== 'undefined') layer.closeAll();
+                // 关闭Bootstrap模态框
+                document.querySelectorAll('.modal').forEach(el => {
+                    const modal = bootstrap.Modal.getInstance(el);
+                    if (modal) modal.hide();
+                });
+                // 点击所有关闭按钮
+                document.querySelectorAll('button:contains("Read"), button:contains("不再提醒")').forEach(btn => btn.click());
+            }
+        """)
+        return True
+    except:
+        return False
+
 def sign_account(index, email, password):
     print(f"\n{'='*20} 账号 {index+1} {'='*20}")
     print(f"👤 账号: {email}")
@@ -69,93 +112,72 @@ def sign_account(index, email, password):
             # 1️⃣ 访问主页
             print(f"🏠 访问主页...")
             page.goto(URL, wait_until='networkidle', timeout=60000)
-            time.sleep(8)  # 等待CF验证
+            time.sleep(8)
             
-            # 2️⃣ 检查是否已登录（通过登出链接或用户头像）
+            # 2️⃣ 检查是否已登录
             if page.query_selector('a[href="/user/logout"]') or page.query_selector('.user-avatar'):
                 print("✅ 已登录状态")
-                # 如果已在用户中心，直接签到
                 if '/user' in page.url:
                     print("📍 已在用户中心页面")
                 else:
-                    # 访问用户中心
                     page.goto(f"{URL}/user", wait_until='networkidle', timeout=30000)
                     time.sleep(5)
             else:
-                # 3️⃣ 未登录，填写登录表单
+                # 3️⃣ 登录
                 print("📝 填写登录信息...")
                 
-                # 等待并填写邮箱
                 page.wait_for_selector('input[name="email"]', state='visible', timeout=20000)
                 page.fill('input[name="email"]', email)
                 
-                # 填写密码（兼容两种name）
                 try:
                     page.fill('input[name="passwd"]', password)
                 except:
-                    try:
-                        page.fill('input[name="password"]', password)
-                    except:
-                        print("❌ 未找到密码输入框")
-                        return f"账号 {email}: ❌ 登录表单异常"
+                    page.fill('input[name="password"]', password)
                 
-                # 等待Turnstile验证（如果有）
                 if page.query_selector('iframe[src*="challenges.cloudflare.com"]'):
-                    print("🔄 等待Turnstile验证...")
+                    print("🔄 等待Turnstile...")
                     time.sleep(10)
                 else:
                     time.sleep(3)
                 
-                # 4️⃣ 点击登录按钮
                 print("🔘 点击登录...")
                 page.click('button[type="submit"]', timeout=20000)
                 
-                # 5️⃣ 等待登录成功（多种方式）
                 print("⏳ 等待登录响应...")
-                logged_in = False
-                
-                # 方式1: 等待URL变化
                 try:
                     page.wait_for_url(f"{URL}/user*", timeout=25000)
-                    logged_in = True
-                    print("✅ 登录成功（URL跳转）")
+                    print("✅ 登录成功")
                 except:
-                    pass
-                
-                # 方式2: 等待出现登出链接或用户中心元素
-                if not logged_in:
-                    try:
-                        page.wait_for_selector('a[href="/user/logout"], .user-avatar', timeout=15000)
-                        logged_in = True
-                        print("✅ 登录成功（检测到用户元素）")
-                    except:
-                        pass
-                
-                # 方式3: 检查当前页面
-                if not logged_in:
                     time.sleep(5)
-                    if page.query_selector('a[href="/user/logout"]') or '/user' in page.url:
-                        logged_in = True
-                        print("✅ 登录成功（页面检查）")
+                    if page.query_selector('a[href="/user/logout"]'):
+                        print("✅ 登录成功（检测到用户元素）")
                     else:
                         print("⚠️ 登录可能失败，尝试继续")
                 
-                # 确保在用户中心
                 if '/user' not in page.url:
                     page.goto(f"{URL}/user", wait_until='networkidle', timeout=30000)
                     time.sleep(5)
             
-            # 6️⃣ 执行签到 - 关键：使用正确的选择器
+            # 4️⃣  关键：关闭弹窗通知
+            print("🔍 检查弹窗...")
+            if close_popup(page):
+                print("✅ 弹窗已关闭")
+            else:
+                print("ℹ️  无弹窗")
+            
+            time.sleep(2)
+            
+            # 5️⃣ 执行签到
             print("📅 执行签到...")
             
-            # 🔥 签到按钮选择器（根据你的截图："每日签到"）
+            # 签到按钮选择器
             btn_selectors = [
                 'button:has-text("每日签到")',
                 'a:has-text("每日签到")',
-                '[onclick*="checkin"]',
-                '[lay-filter="checkin"]',
+                '#checkin-btn',
                 '.checkin-btn',
-                '#checkin-btn'
+                '[onclick*="checkin"]',
+                '[lay-filter="checkin"]'
             ]
             
             clicked = False
@@ -167,31 +189,31 @@ def sign_account(index, email, password):
                         btn.click()
                         clicked = True
                         break
-                except Exception as e:
+                except:
                     continue
             
-            # JS兜底方案
+            # JS兜底
             if not clicked:
                 print("🔘 JS触发签到...")
                 try:
                     result = page.evaluate("""
                         () => {
-                            // 方法1: 查找包含"每日签到"或"签到"的按钮
+                            // 查找包含"每日签到"或"签到"的按钮
                             const buttons = document.querySelectorAll('button, a');
                             for (let btn of buttons) {
                                 if (btn.textContent.includes('每日签到') || btn.textContent.includes('签到')) {
                                     btn.click();
-                                    return 'button_text:' + btn.textContent.trim();
+                                    return 'button:' + btn.textContent.trim();
                                 }
                             }
                             
-                            // 方法2: 调用checkin函数
+                            // 调用checkin函数
                             if (typeof checkin === 'function') {
                                 checkin();
                                 return 'function';
                             }
                             
-                            // 方法3: 尝试常见ID/class
+                            // 尝试常见元素
                             const elements = [
                                 document.getElementById('checkin-btn'),
                                 document.querySelector('.checkin-btn'),
@@ -213,49 +235,47 @@ def sign_account(index, email, password):
                 except Exception as e:
                     print(f"⚠️ JS触发失败: {e}")
             
+            # 6️⃣ 再次关闭可能的签到结果弹窗
+            time.sleep(1)
+            close_popup(page)
+            
             # 7️⃣ 等待并提取结果
             print("⏳ 等待签到结果...")
-            time.sleep(8)  # 增加等待时间
+            time.sleep(8)
             
             msg = None
             
-            # 尝试多种方式提取结果
-            # 方式1: 弹窗消息
-            for selector in ['.msg', '.alert', '.layui-layer-content', '.swal2-html-container', '[role="alert"]']:
+            # 提取结果
+            for selector in ['.msg', '.alert', '.layui-layer-content', '.swal2-html-container']:
                 try:
                     el = page.query_selector(selector)
                     if el and el.is_visible():
                         text = el.inner_text().strip()
-                        if text and len(text) < 200 and ('签到' in text or '获得' in text or '成功' in text):
+                        if text and len(text) < 200:
                             msg = text
-                            print(f"📋 提取结果（弹窗）: {msg}")
+                            print(f"📋 提取结果: {msg}")
                             break
                 except:
                     continue
             
-            # 方式2: 检查页面文本
+            # 页面文本
             if not msg:
                 page_text = page.text_content('body')
                 if '签到成功' in page_text or '获得' in page_text:
-                    # 提取具体流量信息
                     import re
                     match = re.search(r'获得.*?(\d+\.?\d*)\s*(GB|MB)', page_text)
                     if match:
                         msg = f"✅ 签到成功，获得 {match.group(1)}{match.group(2)}"
                     else:
                         msg = "✅ 签到成功"
-                    print(f"📋 提取结果（页面）: {msg}")
-                elif '今日已签到' in page_text or '已经签到' in page_text:
+                elif '今日已签到' in page_text:
                     msg = "ℹ️ 今日已签到"
-                    print(f"📋 提取结果（已签到）: {msg}")
             
-            # 方式3: 检查按钮是否变成"明日再来"
+            # 检查按钮变化
             if not msg:
                 try:
-                    checkin_btn = page.query_selector('button:has-text("明日再来"), a:has-text("明日再来")')
-                    if checkin_btn:
+                    if page.query_selector('button:has-text("明日再来")'):
                         msg = "✅ 签到成功（按钮变为'明日再来'）"
-                        print(f"📋 提取结果（按钮变化）: {msg}")
                 except:
                     pass
             
@@ -263,7 +283,7 @@ def sign_account(index, email, password):
                 print(f"🎉 结果: {msg}")
                 result_msg = f"账号 {email}: {msg}"
             else:
-                print("⚠️ 未检测到签到结果，保存截图")
+                print("⚠️ 未检测到签到结果")
                 result_msg = f"账号 {email}: ❓ 未检测到结果"
                     
         except Exception as e:
