@@ -39,6 +39,53 @@ def push_notification(title, content):
     except:
         pass
 
+def wait_for_turnstile_complete(page, timeout=90):
+    """等待Cloudflare Turnstile验证完全完成（包括token生成）"""
+    print("🔄 等待Turnstile验证...")
+    start = time.time()
+    
+    while time.time() - start < timeout:
+        try:
+            # 🔥 关键：检查token是否生成（不仅仅是iframe消失）
+            token = page.evaluate("""
+                () => {
+                    const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+                    if (!iframe) {
+                        // iframe消失后，检查是否有token
+                        const inputs = document.querySelectorAll('input[name*="cf-turnstile"]');
+                        for (let input of inputs) {
+                            if (input.value && input.value.length > 20) {
+                                return input.value;
+                            }
+                        }
+                        return null;
+                    }
+                    try {
+                        return iframe.contentWindow?.document.querySelector('input[name="cf-turnstile-response"]')?.value;
+                    } catch { return null; }
+                }
+            """)
+            
+            if token and len(token) > 20:
+                print(f"✅ Turnstile完成（token长度: {len(token)}）")
+                return True
+            
+            # 检查iframe是否消失
+            iframe = page.query_selector('iframe[src*="challenges.cloudflare.com"]')
+            if not iframe:
+                print("⏳ Turnstile iframe消失，等待token生成...")
+                time.sleep(3)  # 等待token生成
+                continue
+                
+        except Exception as e:
+            print(f"⚠️ Turnstile检查异常: {e}")
+        
+        print(f"⏳ Turnstile验证中... ({int(time.time()-start)}s)")
+        time.sleep(3)
+    
+    print("⚠️ Turnstile等待超时，尝试继续")
+    return False
+
 def close_all_popups(page):
     """关闭所有可能的弹窗"""
     try:
@@ -48,8 +95,7 @@ def close_all_popups(page):
             'button:has-text("确定")',
             'button:has-text("关闭")',
             '.swal2-confirm',
-            '.layui-layer-btn0',
-            '[class*="modal-close"]'
+            '.layui-layer-btn0'
         ]
         
         for selector in popup_buttons:
@@ -59,7 +105,7 @@ def close_all_popups(page):
                     if btn.is_visible():
                         btn.click()
                         print(f"🔘 关闭弹窗: {selector}")
-                        time.sleep(0.5)
+                        time.sleep(1)
             except:
                 continue
         
@@ -70,13 +116,6 @@ def close_all_popups(page):
                 if (typeof Swal !== 'undefined') Swal.close();
                 // 关闭Layui弹窗
                 if (typeof layer !== 'undefined') layer.closeAll();
-                // 关闭所有模态框
-                document.querySelectorAll('.modal').forEach(el => {
-                    if (el.classList.contains('show')) {
-                        el.classList.remove('show');
-                        el.style.display = 'none';
-                    }
-                });
                 // 点击所有确定按钮
                 document.querySelectorAll('button').forEach(btn => {
                     if (btn.textContent.includes('OK') || btn.textContent.includes('确定')) {
@@ -88,42 +127,6 @@ def close_all_popups(page):
         return True
     except:
         return False
-
-def wait_for_turnstile_complete(page, timeout=60):
-    """等待Cloudflare Turnstile验证完全完成"""
-    print("🔄 等待Turnstile验证...")
-    start = time.time()
-    
-    while time.time() - start < timeout:
-        try:
-            # 方法1: 检查token是否生成
-            token = page.evaluate("""
-                () => {
-                    const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-                    if (!iframe) return null;
-                    try {
-                        return iframe.contentWindow?.document.querySelector('input[name="cf-turnstile-response"]')?.value;
-                    } catch { return null; }
-                }
-            """)
-            if token and len(token) > 20:
-                print("✅ Turnstile完成（获取到token）")
-                return True
-            
-            # 方法2: 检查iframe是否消失
-            iframe = page.query_selector('iframe[src*="challenges.cloudflare.com"]')
-            if not iframe:
-                print("✅ Turnstile完成（iframe消失）")
-                return True
-                
-        except:
-            pass
-        
-        print(f"⏳ Turnstile验证中... ({int(time.time()-start)}s)")
-        time.sleep(3)
-    
-    print("⚠️ Turnstile等待超时，尝试继续")
-    return False
 
 def is_logged_in(page):
     """检查是否已登录"""
@@ -173,11 +176,6 @@ def sign_account(index, email, password):
             page.goto(URL, wait_until='networkidle', timeout=60000)
             time.sleep(5)
             
-            # 🔥 关键：先关闭可能的初始弹窗
-            print("🔍 检查初始弹窗...")
-            close_all_popups(page)
-            time.sleep(2)
-            
             # 2️⃣ 检查是否已登录
             if is_logged_in(page):
                 print("✅ 已登录状态")
@@ -198,12 +196,18 @@ def sign_account(index, email, password):
                 except:
                     page.fill('input[name="password"]', password)
                 
-                # 🔥 关键：等待Turnstile验证完成
-                wait_for_turnstile_complete(page, timeout=60)
+                # 🔥 关键：等待Turnstile验证完全完成（包括token生成）
+                turnstile_success = wait_for_turnstile_complete(page, timeout=90)
+                
+                if not turnstile_success:
+                    print("❌ Turnstile验证失败")
+                    page.screenshot(path=f'turnstile_failed_{int(time.time())}.png')
+                    return f"账号 {email}: ❌ 验证码验证失败"
+                
                 time.sleep(3)  # 额外等待确保验证生效
                 
-                # 🔥 关键：再次关闭可能的弹窗（身份验证弹窗）
-                print("🔍 检查登录前弹窗...")
+                # 🔥 关键：关闭可能的身份验证弹窗
+                print("🔍 检查身份验证弹窗...")
                 close_all_popups(page)
                 time.sleep(2)
                 
@@ -212,7 +216,7 @@ def sign_account(index, email, password):
                 page.click('button[type="submit"]', timeout=20000)
                 
                 # 🔥 关键：关闭登录后的弹窗
-                time.sleep(2)
+                time.sleep(3)
                 close_all_popups(page)
                 time.sleep(2)
                 
