@@ -2,7 +2,6 @@ name: iKuuu Check-in
 
 on:
   schedule:
-    # UTC 时间，对应北京时间 8:00 和 20:00
     - cron: '0 0 * * *'
     - cron: '0 12 * * *'
   workflow_dispatch:
@@ -22,7 +21,7 @@ jobs:
       - name: Install xvfb
         run: sudo apt-get update && sudo apt-get install -y xvfb
 
-      - name: Install Python dependencies
+      - name: Install dependencies
         run: |
           pip install -r requirements.txt
           python -m playwright install chromium
@@ -35,10 +34,10 @@ jobs:
           PASSWD: ${{ secrets.PASSWD }}
           CONFIG: ${{ secrets.CONFIG }}
           SCKEY: ${{ secrets.SCKEY }}
-        # 关键：xvfb-run 提供虚拟显示器，让浏览器以有头模式运行
+          CAPSOLVER_KEY: ${{ secrets.CAPSOLVER_KEY }}
         run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python checkin.py
 
-      - name: Upload debug screenshots
+      - name: Upload screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
