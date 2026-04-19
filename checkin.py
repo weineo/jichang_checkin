@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-iKuuu 机场自动签到 - 增强版
-基于原版改进：
-  1. xvfb 有头模式绕过 Turnstile 检测
-  2. 登录后优先 API 签到（最稳定）
-  3. 全面反检测注入（12项）
-  4. 每步截图，上传 Artifact 可查看
-  5. 多选择器容错 + 自动列出页面元素辅助调试
+iKuuu 机场自动签到 - 增强版 v2.1
+核心改进：
+  1. 自动探测登录页路径（不再硬编码 /auth/login）
+  2. xvfb 有头模式绕过 Turnstile 检测
+  3. 登录后优先 API 签到（最稳定）
+  4. 全面反检测注入（12项）
+  5. 每步截图，上传 Artifact 可查看
 """
 
 import os
@@ -19,32 +19,31 @@ import json
 from pathlib import Path
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
-# ==================== 环境变量（与你已配置的完全一致）====================
+# ==================== 环境变量 ====================
 URL = os.environ.get('URL', '').rstrip('/')
 SCKEY = os.environ.get('SCKEY', '')
 EMAIL = os.environ.get('EMAIL', '')
 PASSWD = os.environ.get('PASSWD', '')
 CONFIG = os.environ.get('CONFIG', '')
 
-# 截图目录
 SCREENSHOT_DIR = Path("debug")
 
 
-# ==================== 账号解析（完全复用原逻辑）====================
+# ==================== 账号解析 ====================
 
 def get_accounts():
     accounts = []
     if CONFIG.strip():
         lines = [line.strip() for line in CONFIG.strip().splitlines() if line.strip()]
         if len(lines) % 2 != 0:
-            print("⚠️ CONFIG格式错误，应为邮箱密码交替排列")
+            print("⚠️ CONFIG格式错误")
             return []
         for i in range(0, len(lines), 2):
             accounts.append((lines[i], lines[i+1]))
     elif EMAIL and PASSWD:
         accounts.append((EMAIL, PASSWD))
     else:
-        print("❌ 未配置账号（需要 EMAIL+PASSWD 或 CONFIG）")
+        print("❌ 未配置账号")
     return accounts
 
 
@@ -57,7 +56,6 @@ def log(msg, level="INFO"):
 
 
 def take_screenshot(page, name):
-    """保存调试截图"""
     try:
         SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
         path = SCREENSHOT_DIR / f"{name}.png"
@@ -84,19 +82,17 @@ def push_notification(title, content):
 
 
 def close_all_popups(page):
-    """关闭所有弹窗（强化版）"""
     closed = 0
     selectors = [
         '.swal2-confirm', '.swal2-close', '.swal2-deny',
-        'button:has-text("OK")', 'button:has-text("Ok")', 'button:has-text("ok")',
+        'button:has-text("OK")', 'button:has-text("Ok")',
         'button:has-text("确定")', 'button:has-text("确认")', 'button:has-text("知道了")',
         'button:has-text("关闭")', 'button:has-text("Close")', 'button:has-text("Got it")',
-        'button:has-text("我已知晓")', 'button:has-text("取消")',
+        'button:has-text("我已知晓")',
         '.layui-layer-btn0', '.layui-layer-close1', '.layui-layer-close',
         '.btn-close', '.modal .btn-primary',
         '[class*="confirm-btn"]', '[class*="close-btn"]',
     ]
-    
     for sel in selectors:
         try:
             buttons = page.query_selector_all(sel)
@@ -111,8 +107,6 @@ def close_all_popups(page):
                     continue
         except:
             continue
-    
-    # JS 关闭
     try:
         page.evaluate("""
             () => {
@@ -122,53 +116,36 @@ def close_all_popups(page):
         """)
     except:
         pass
-    
-    # Escape
     try:
         page.keyboard.press('Escape')
         time.sleep(0.3)
     except:
         pass
-    
     return closed
 
 
 def is_logged_in(page):
-    """检查是否已登录（增强版）"""
     try:
         if '/user' in page.url and '/auth/login' not in page.url:
             return True
-        if page.query_selector('a[href="/user/logout"]'):
-            return True
-        if page.query_selector('a[href*="logout"]'):
+        if page.query_selector('a[href="/user/logout"], a[href*="logout"]'):
             return True
         if page.query_selector('.user-avatar, .user-info, #user-center'):
             return True
         if page.query_selector('button:has-text("每日签到"), button:has-text("明日再来"), #checkin-btn'):
             return True
-        # 检查导航栏中的用户相关元素
-        if page.query_selector('a[href*="/user"], a[href*="/dashboard"]'):
-            try:
-                el = page.query_selector('a[href*="/user"]')
-                if el and el.is_visible():
-                    return True
-            except:
-                pass
         return False
     except:
         return False
 
 
 def wait_for_turnstile_complete(page, timeout=120):
-    """等待 Cloudflare Turnstile 验证完全完成"""
     log("等待 Turnstile 验证...", "STEP")
     start = time.time()
-    
     while time.time() - start < timeout:
         try:
             token = page.evaluate("""
                 () => {
-                    // 方法1: 检查隐藏 input 中的 token
                     const sels = [
                         'input[name="cf-turnstile-response"]',
                         'input[name*="turnstile"]',
@@ -179,8 +156,6 @@ def wait_for_turnstile_complete(page, timeout=120):
                         const el = document.querySelector(sel);
                         if (el && el.value && el.value.length > 20) return el.value;
                     }
-                    
-                    // 方法2: 通过 turnstile API
                     try {
                         if (window.turnstile) {
                             const containers = document.querySelectorAll('.cf-turnstile');
@@ -197,42 +172,25 @@ def wait_for_turnstile_complete(page, timeout=120):
                             }
                         }
                     } catch(e) {}
-                    
-                    // 方法3: iframe 内部
-                    try {
-                        const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-                        if (iframe) {
-                            const inner = iframe.contentWindow?.document?.querySelector('input[name="cf-turnstile-response"]');
-                            if (inner && inner.value && inner.value.length > 20) return inner.value;
-                        }
-                    } catch(e) {}
-                    
                     return null;
                 }
             """)
-            
             if token and len(token) > 20:
                 log(f"Turnstile 完成! (token: {len(token)} 字符, 耗时 {int(time.time()-start)}s)", "OK")
                 return True
-            
         except Exception as e:
             log(f"Turnstile 检查异常: {e}", "WARN")
-        
         elapsed = int(time.time() - start)
         if elapsed % 15 == 0 and elapsed > 0:
             log(f"Turnstile 等待中... ({elapsed}s)")
             take_screenshot(page, f"turnstile_wait_{elapsed}s")
-        
         time.sleep(3)
-    
     log("Turnstile 等待超时，尝试继续", "WARN")
     return False
 
 
 def api_checkin(base_url, cookies_dict):
-    """用 cookies 直接调签到 API（最可靠的方式）"""
     import requests
-    
     session = requests.Session()
     session.cookies.update(cookies_dict)
     session.headers.update({
@@ -241,60 +199,46 @@ def api_checkin(base_url, cookies_dict):
         'Origin': base_url,
         'Accept': 'application/json, text/plain, */*',
     })
-    
     endpoints = [
         '/user/checkin',
         '/api/v1/user/checkin',
         '/api/user/checkin',
         '/user/checkin/post',
     ]
-    
     for endpoint in endpoints:
         try:
             url = f"{base_url}{endpoint}"
             log(f"尝试 API: POST {url}")
             r = session.post(url, timeout=15, allow_redirects=False)
-            
             if r.status_code == 200:
                 try:
                     data = r.json()
                     log(f"API 响应: {json.dumps(data, ensure_ascii=False)}")
                     msg = data.get('msg', data.get('data', ''))
-                    
                     if data.get('ret') == 1 or data.get('success') is True:
                         return True, msg or '签到成功'
-                    
-                    # ret=0 但有 msg，可能是"已签到"
                     if msg and ('已签到' in msg or '已经签到' in msg or 'already' in msg.lower()):
                         return True, msg
-                    
                     if msg:
                         return False, msg
-                        
                 except json.JSONDecodeError:
                     log(f"非 JSON: {r.text[:200]}", "WARN")
-                    
             elif r.status_code == 302:
                 loc = r.headers.get('Location', '')
-                log(f"302 重定向 → {loc}", "WARN")
-                if '/auth/login' in loc:
-                    return False, "Cookie 已过期，需要重新登录"
+                log(f"302 → {loc}", "WARN")
+                if '/auth/login' in loc or '/login' in loc:
+                    return False, "Cookie 已过期"
             else:
                 log(f"HTTP {r.status_code}", "WARN")
-                
         except Exception as e:
             log(f"API 请求异常: {e}", "WARN")
-    
     return False, "所有 API 端点均失败"
 
 
-# ==================== 反检测注入脚本 ====================
+# ==================== 反检测注入 ====================
 
 ANTI_DETECT_SCRIPT = """
-    // 1. 隐藏 webdriver 标识（最关键）
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-
-    // 2. 模拟 Chrome 特有对象
     if (!window.chrome) window.chrome = {};
     window.chrome.runtime = { connect: function(){}, sendMessage: function(){} };
     window.chrome.loadTimes = function() { return {}; };
@@ -304,8 +248,6 @@ ANTI_DETECT_SCRIPT = """
         InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
         RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' },
     };
-
-    // 3. 修正 plugins
     Object.defineProperty(navigator, 'plugins', {
         get: () => {
             const arr = [
@@ -317,53 +259,33 @@ ANTI_DETECT_SCRIPT = """
             return arr;
         }
     });
-
-    // 4. 修正 mimeTypes
     Object.defineProperty(navigator, 'mimeTypes', {
-        get: () => {
-            return [
-                { type: 'application/pdf', suffixes: 'pdf', description: 'Portable Document Format' },
-                { type: 'application/x-google-chrome-pdf', suffixes: 'pdf', description: 'Portable Document Format' },
-            ];
-        }
+        get: () => [
+            { type: 'application/pdf', suffixes: 'pdf', description: 'Portable Document Format' },
+            { type: 'application/x-google-chrome-pdf', suffixes: 'pdf', description: 'Portable Document Format' },
+        ]
     });
-
-    // 5. 修正语言
     Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en-US', 'en'] });
-
-    // 6. 修正平台
     Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
-
-    // 7. 修正 hardwareConcurrency
     Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
-
-    // 8. 修正 deviceMemory
     Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
-
-    // 9. 修正 connection
     if (!navigator.connection) {
         Object.defineProperty(navigator, 'connection', {
             get: () => ({ effectiveType: '4g', rtt: 50, downlink: 10, saveData: false })
         });
     }
-
-    // 10. Permissions API 修复
     const origQuery = window.navigator.permissions.query;
     window.navigator.permissions.query = (parameters) => (
         parameters.name === 'notifications'
             ? Promise.resolve({ state: Notification.permission })
             : origQuery(parameters)
     );
-
-    // 11. 修复 toString 检测
     const origToString = Function.prototype.toString;
     const marked = new Set();
     Function.prototype.toString = function() {
         if (marked.has(this)) return 'function ' + (this.name || '') + '() { [native code] }';
         return origToString.call(this);
     };
-
-    // 12. WebGL 渲染器修复
     const getParam = WebGLRenderingContext.prototype.getParameter;
     WebGLRenderingContext.prototype.getParameter = function(p) {
         if (p === 37445) return 'Intel Inc.';
@@ -371,6 +293,189 @@ ANTI_DETECT_SCRIPT = """
         return getParam.call(this, p);
     };
 """
+
+
+# ==================== 核心改动：自动探测登录页 ====================
+
+def navigate_to_login(page, base_url):
+    """
+    自动探测登录页路径，不再硬编码 /auth/login
+    SSPANEL 不同版本/主题的登录路径各不相同：
+      - /auth/login
+      - /#/auth/login （SPA hash 路由）
+      - /login
+      - /#login
+      - 主页直接有登录表单
+    """
+    
+    # 所有可能的登录路径，按优先级排列
+    login_paths = [
+        '/auth/login',
+        '/#/auth/login',
+        '/#/login',
+        '/login',
+        '/auth',
+        '/#login',
+        '/user/login',
+    ]
+    
+    # ========== 第一步：先访问主页，查看页面上是否有登录链接 ==========
+    log(f"先访问主页 {base_url} 探测登录入口...", "STEP")
+    try:
+        resp = page.goto(base_url, wait_until='domcontentloaded', timeout=60000)
+        log(f"主页 HTTP {resp.status if resp else 'N/A'}")
+    except Exception as e:
+        log(f"访问主页异常: {e}", "WARN")
+    
+    time.sleep(5)
+    
+    # 检查是否已经是登录页（主页直接就是登录表单）
+    login_form = page.query_selector('input[name="email"], input[type="email"], input[name="passwd"], input[type="password"]')
+    if login_form:
+        log("主页直接包含登录表单!", "OK")
+        return True
+    
+    # 从主页提取所有登录相关链接
+    login_links = page.evaluate("""
+        () => {
+            const links = [];
+            document.querySelectorAll('a[href]').forEach(a => {
+                const href = a.href || '';
+                const text = (a.textContent || '').trim().toLowerCase();
+                if (href.includes('login') || href.includes('auth') || 
+                    text.includes('登录') || text.includes('login') || text.includes('sign in')) {
+                    links.push({ href: href, text: text.substring(0, 30) });
+                }
+            });
+            return links;
+        }
+    """)
+    
+    if login_links:
+        log(f"主页发现 {len(login_links)} 个登录相关链接:", "OK")
+        for link in login_links:
+            log(f"  → {link['href']} (文字: {link['text']})")
+        
+        # 优先点击包含"登录"文字的链接
+        for link in login_links:
+            href = link['href']
+            text = link['text']
+            if '登录' in text or 'login' in text.lower() or 'sign' in text.lower():
+                try:
+                    log(f"点击登录链接: {href}")
+                    page.goto(href, wait_until='domcontentloaded', timeout=30000)
+                    time.sleep(3)
+                    # 检查是否有登录表单
+                    if page.query_selector('input[name="email"], input[type="email"], input[name="passwd"], input[type="password"]'):
+                        log("成功到达登录页!", "OK")
+                        return True
+                except:
+                    continue
+    
+    # ========== 第二步：逐个尝试常见登录路径 ==========
+    log("逐个尝试常见登录路径...", "STEP")
+    
+    for path in login_paths:
+        full_url = f"{base_url}{path}"
+        log(f"尝试: {full_url}")
+        try:
+            resp = page.goto(full_url, wait_until='domcontentloaded', timeout=20000)
+            status = resp.status if resp else 0
+            log(f"  HTTP {status}")
+            
+            time.sleep(3)
+            
+            # 检查是否是404
+            if status == 404:
+                log(f"  404，跳过")
+                continue
+            
+            # 检查页面标题是否包含404
+            title = page.title()
+            if '404' in title:
+                log(f"  页面404，跳过")
+                continue
+            
+            # 检查页面内容是否有登录表单
+            page_text = page.text_content('body') or ''
+            
+            # 检查是否有邮箱/密码输入框
+            has_email = page.query_selector('input[name="email"], input[type="email"], input[placeholder*="邮箱"], input[placeholder*="email" i]')
+            has_passwd = page.query_selector('input[name="passwd"], input[name="password"], input[type="password"]')
+            
+            if has_email or has_passwd:
+                log(f"找到登录页! 路径: {path}", "OK")
+                take_screenshot(page, "login_page_found")
+                return True
+            
+            # 如果是 SPA 的 hash 路由，页面可能需要加载
+            if '#' in path:
+                time.sleep(3)
+                has_email = page.query_selector('input[name="email"], input[type="email"], input[placeholder*="邮箱"]')
+                has_passwd = page.query_selector('input[name="passwd"], input[name="password"], input[type="password"]')
+                if has_email or has_passwd:
+                    log(f"找到登录页! 路径: {path}", "OK")
+                    take_screenshot(page, "login_page_found")
+                    return True
+                    
+        except Exception as e:
+            log(f"  异常: {e}", "WARN")
+            continue
+    
+    # ========== 第三步：回到主页，尝试点击页面中的登录按钮 ==========
+    log("尝试从主页点击登录按钮...", "STEP")
+    try:
+        page.goto(base_url, wait_until='domcontentloaded', timeout=30000)
+        time.sleep(3)
+        close_all_popups(page)
+        
+        # 尝试点击登录按钮/链接
+        login_btn_selectors = [
+            'a:has-text("登录")',
+            'a:has-text("Login")',
+            'button:has-text("登录")',
+            'a:has-text("Sign In")',
+            'a[href*="login"]',
+            'a[href*="auth"]',
+            '.login-btn',
+            '#login-btn',
+            'a.nav-link:has-text("登录")',
+        ]
+        
+        for sel in login_btn_selectors:
+            try:
+                el = page.query_selector(sel)
+                if el and el.is_visible():
+                    log(f"点击: {sel}")
+                    el.click()
+                    time.sleep(5)
+                    
+                    if page.query_selector('input[name="email"], input[type="email"], input[name="passwd"], input[type="password"]'):
+                        log("成功到达登录页!", "OK")
+                        take_screenshot(page, "login_page_found")
+                        return True
+            except:
+                continue
+    except:
+        pass
+    
+    # ========== 最终：截图当前页面，返回失败 ==========
+    take_screenshot(page, "login_page_not_found")
+    
+    # 打印当前页面所有链接，辅助调试
+    all_links = page.evaluate("""
+        () => {
+            return Array.from(document.querySelectorAll('a[href]')).slice(0, 50).map(a => ({
+                href: a.href,
+                text: (a.textContent || '').trim().substring(0, 30)
+            }));
+        }
+    """)
+    log("页面上所有链接:", "WARN")
+    for link in all_links:
+        log(f"  {link['href']}  ({link['text']})", "WARN")
+    
+    return False
 
 
 # ==================== 主签到流程 ====================
@@ -384,10 +489,9 @@ def sign_account(index, email, password):
     user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
     
     with sync_playwright() as p:
-        # ====== 启动浏览器 ======
         has_display = bool(os.environ.get('DISPLAY'))
         headless = not has_display
-        log(f"显示环境: {'xvfb (' + os.environ.get('DISPLAY') + ')' if has_display else '无'} → {'有头' if not headless else '无头'}模式")
+        log(f"显示环境: {'xvfb' if has_display else '无'} → {'有头' if not headless else '无头'}模式")
         
         browser = p.chromium.launch(
             headless=headless,
@@ -411,19 +515,17 @@ def sign_account(index, email, password):
             extra_http_headers={'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'},
         )
         
-        # 全面反检测注入
         context.add_init_script(ANTI_DETECT_SCRIPT)
-        
         page = context.new_page()
         
         try:
-            # ====== 1. 访问登录页 ======
-            login_url = f"{URL}/auth/login"
-            log(f"访问 {login_url}", "STEP")
+            # ====== 1. 自动探测并导航到登录页 ======
+            log("探测登录页...", "STEP")
+            found_login = navigate_to_login(page, URL)
             
-            resp = page.goto(login_url, wait_until='domcontentloaded', timeout=60000)
-            log(f"HTTP {resp.status if resp else 'N/A'}")
-            time.sleep(5)
+            if not found_login:
+                raise Exception("未找到登录页，请检查 URL 是否正确，或网站是否改版")
+            
             take_screenshot(page, f"acct{index}_01_login_page")
             
             # ====== 2. 等待 Cloudflare ======
@@ -431,7 +533,7 @@ def sign_account(index, email, password):
             cf_passed = False
             for i in range(24):
                 title = page.title()
-                if "Just a moment" in title or "Checking" in title or "cloudflare" in title.lower():
+                if "Just a moment" in title or "Checking" in title:
                     if (i + 1) % 3 == 0:
                         log(f"Cloudflare 验证中... ({(i+1)*5}s)")
                     time.sleep(5)
@@ -444,10 +546,9 @@ def sign_account(index, email, password):
                 log("Cloudflare 超时，继续尝试...", "WARN")
             
             time.sleep(3)
-            take_screenshot(page, f"acct{index}_02_after_cf")
             close_all_popups(page)
             
-            # 检查是否已经登录
+            # ====== 3. 检查是否已登录 ======
             if is_logged_in(page):
                 log("已是登录状态", "OK")
                 if '/user' not in page.url:
@@ -455,13 +556,13 @@ def sign_account(index, email, password):
                     time.sleep(5)
                     close_all_popups(page)
             else:
-                # ====== 3. 填写登录信息 ======
+                # ====== 4. 填写登录信息 ======
                 log("填写登录信息...", "STEP")
                 
-                # 邮箱
                 email_filled = False
                 for sel in ['input[name="email"]', 'input[type="email"]', '#email',
-                           'input[placeholder*="邮箱"]', 'input[placeholder*="email" i]']:
+                           'input[placeholder*="邮箱"]', 'input[placeholder*="email" i]',
+                           'input[placeholder*="Email"]']:
                     try:
                         el = page.query_selector(sel)
                         if el and el.is_visible():
@@ -476,7 +577,6 @@ def sign_account(index, email, password):
                         continue
                 
                 if not email_filled:
-                    # 打印所有 input 帮助调试
                     inputs_info = page.evaluate("""
                         () => Array.from(document.querySelectorAll('input'))
                             .map(el => `${el.name||'-'} | ${el.type} | ${el.placeholder||'-'} | vis=${el.offsetParent!==null}`)
@@ -486,10 +586,9 @@ def sign_account(index, email, password):
                         log(f"  {info}", "WARN")
                     raise Exception("未找到邮箱输入框")
                 
-                # 密码
                 pwd_filled = False
                 for sel in ['input[name="passwd"]', 'input[name="password"]', 'input[type="password"]',
-                           '#passwd', '#password', 'input[placeholder*="密码"]']:
+                           '#passwd', '#password', 'input[placeholder*="密码"]', 'input[placeholder*="password" i]']:
                     try:
                         el = page.query_selector(sel)
                         if el and el.is_visible():
@@ -508,10 +607,10 @@ def sign_account(index, email, password):
                 
                 take_screenshot(page, f"acct{index}_03_form_filled")
                 
-                # ====== 4. 等待 Turnstile ======
+                # ====== 5. 等待 Turnstile ======
                 turnstile_ok = wait_for_turnstile_complete(page, timeout=120)
                 if not turnstile_ok:
-                    log("Turnstile 验证未通过，继续尝试登录...", "WARN")
+                    log("Turnstile 未通过，继续尝试...", "WARN")
                     take_screenshot(page, f"acct{index}_turnstile_timeout")
                 
                 time.sleep(3)
@@ -519,7 +618,7 @@ def sign_account(index, email, password):
                 time.sleep(1)
                 take_screenshot(page, f"acct{index}_04_after_turnstile")
                 
-                # ====== 5. 点击登录 ======
+                # ====== 6. 点击登录 ======
                 log("点击登录...", "STEP")
                 
                 login_clicked = False
@@ -545,11 +644,10 @@ def sign_account(index, email, password):
                 time.sleep(1)
                 take_screenshot(page, f"acct{index}_05_after_login")
                 
-                # ====== 6. 确认登录 ======
+                # ====== 7. 确认登录 ======
                 log("确认登录状态...", "STEP")
                 logged_in = False
                 
-                # URL 检测
                 try:
                     page.wait_for_url(f"{URL}/user*", timeout=30000)
                     logged_in = True
@@ -557,17 +655,15 @@ def sign_account(index, email, password):
                 except PlaywrightTimeout:
                     pass
                 
-                # 元素检测
                 if not logged_in:
                     try:
-                        page.wait_for_selector('a[href="/user/logout"], a[href*="logout"], #checkin-btn, button:has-text("每日签到")', 
+                        page.wait_for_selector('a[href="/user/logout"], a[href*="logout"], #checkin-btn, button:has-text("每日签到")',
                                              timeout=20000)
                         logged_in = True
                         log("登录成功 (元素)", "OK")
                     except PlaywrightTimeout:
                         pass
                 
-                # 轮询检测
                 if not logged_in:
                     for _ in range(10):
                         if is_logged_in(page):
@@ -577,23 +673,21 @@ def sign_account(index, email, password):
                         time.sleep(2)
                 
                 if not logged_in:
-                    # 最后尝试直接访问用户中心
                     log("登录状态不确定，直接访问用户中心...", "WARN")
                     page.goto(f"{URL}/user", wait_until='domcontentloaded', timeout=30000)
                     time.sleep(3)
                     close_all_popups(page)
                     
-                    if '/auth/login' in page.url:
+                    if '/auth/login' in page.url or '/login' in page.url:
                         take_screenshot(page, f"acct{index}_error_login_failed")
                         raise Exception("登录失败 - 被重定向回登录页")
                     logged_in = True
                 
                 take_screenshot(page, f"acct{index}_06_logged_in")
             
-            # ====== 7. 签到 ======
+            # ====== 8. 签到 ======
             log("执行签到...", "STEP")
             
-            # 确保在用户中心
             if '/user' not in page.url:
                 page.goto(f"{URL}/user", wait_until='domcontentloaded', timeout=30000)
                 time.sleep(3)
@@ -601,7 +695,7 @@ def sign_account(index, email, password):
             
             take_screenshot(page, f"acct{index}_07_user_panel")
             
-            # ✅ 优先方案：API 签到（最可靠）
+            # 优先 API 签到
             cookies = context.cookies()
             cookie_dict = {c['name']: c['value'] for c in cookies}
             log(f"获取到 {len(cookie_dict)} 个 cookies: {list(cookie_dict.keys())}")
@@ -614,7 +708,7 @@ def sign_account(index, email, password):
             else:
                 log(f"API 签到未成功: {api_msg}，尝试页面签到...", "WARN")
                 
-                # 备选方案：页面点击签到
+                # 页面点击签到
                 clicked = False
                 for sel in [
                     'button:has-text("每日签到")',
@@ -639,7 +733,6 @@ def sign_account(index, email, password):
                         continue
                 
                 if not clicked:
-                    # 列出所有可见按钮帮助调试
                     elements_info = page.evaluate("""
                         () => {
                             const btns = document.querySelectorAll('button, a, input[type="submit"], [onclick]');
@@ -658,12 +751,11 @@ def sign_account(index, email, password):
                     for info in elements_info:
                         log(f"  {info['tag']} text='{info['text']}' id='{info['id']}' class='{info['cls']}'", "WARN")
                     
-                    # 最后兜底：JS 直接触发
+                    # JS 兜底
                     log("JS 兜底签到...", "WARN")
                     try:
                         js_result = page.evaluate("""
                             async () => {
-                                // 查找按钮点击
                                 const btns = document.querySelectorAll('button, a');
                                 for (let btn of btns) {
                                     const t = btn.textContent.trim();
@@ -672,9 +764,7 @@ def sign_account(index, email, password):
                                         return 'clicked:' + t;
                                     }
                                 }
-                                // 调用函数
                                 if (typeof checkin === 'function') { checkin(); return 'function'; }
-                                // fetch API
                                 try {
                                     const r = await fetch('/user/checkin', {
                                         method: 'POST',
@@ -686,10 +776,9 @@ def sign_account(index, email, password):
                             }
                         """)
                         log(f"JS 签到结果: {js_result}")
-                        
                         try:
-                            data = json.loads(js_result) if isinstance(js_result, str) and js_result.startswith('{') else None
-                            if data:
+                            if isinstance(js_result, str) and js_result.startswith('{'):
+                                data = json.loads(js_result)
                                 if data.get('ret') == 1 or data.get('success') is True:
                                     result_msg = data.get('msg', '签到成功')
                                     success = True
@@ -700,17 +789,13 @@ def sign_account(index, email, password):
                             pass
                     except Exception as e:
                         log(f"JS 签到异常: {e}", "WARN")
-                
                 else:
-                    # 点击后等待结果
                     time.sleep(3)
                     close_all_popups(page)
                     take_screenshot(page, f"acct{index}_08_after_checkin")
                     
-                    # 提取签到结果
                     time.sleep(5)
                     
-                    # 从弹窗获取
                     for sel in ['.swal2-html-container', '.swal2-content', '.swal2-title',
                                 '.msg', '.alert', '.layui-layer-content',
                                 '.toast-body', '.toast-message', '.noty_body']:
@@ -725,7 +810,6 @@ def sign_account(index, email, password):
                         except:
                             continue
                     
-                    # 从页面文本匹配
                     if not result_msg:
                         try:
                             body = page.text_content('body') or ""
@@ -739,7 +823,6 @@ def sign_account(index, email, password):
                         except:
                             pass
                     
-                    # 按钮变化
                     if not result_msg:
                         try:
                             if page.query_selector('button:has-text("明日再来")'):
@@ -766,7 +849,6 @@ def sign_account(index, email, password):
             except:
                 pass
     
-    # 格式化结果
     if success:
         return f"账号 {email}: ✅ {result_msg}"
     else:
@@ -785,7 +867,7 @@ if __name__ == '__main__':
         sys.exit(1)
     
     log("=" * 55)
-    log(f"  iKuuu 机场自动签到 v2.0")
+    log(f"  iKuuu 机场自动签到 v2.1")
     log(f"  目标: {URL}")
     log(f"  共 {len(accounts)} 个账号")
     log("=" * 55)
@@ -799,11 +881,8 @@ if __name__ == '__main__':
             log(f"等待 {wait}s 后处理下一个账号...")
             time.sleep(wait)
     
-    # 推送通知
     if SCKEY and results:
-        summary = "## 📊 iKuuu 签到结果\n\n" + "\n\n".join(
-            f"- {r}" for r in results
-        )
+        summary = "## 📊 iKuuu 签到结果\n\n" + "\n\n".join(f"- {r}" for r in results)
         push_notification("机场签到", summary)
     
     log("\n" + "=" * 55)
@@ -812,6 +891,5 @@ if __name__ == '__main__':
     log("=" * 55)
     log("🏁 完成")
     
-    # 全部失败则退出码1
     if all("❌" in r for r in results):
         sys.exit(1)
