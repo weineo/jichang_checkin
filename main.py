@@ -3,7 +3,8 @@
 import os
 import time
 import random
-from playwright.sync_api import sync_playwright
+import re
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 URL = os.environ.get('URL', '').rstrip('/')
 SCKEY = os.environ.get('SCKEY', '')
@@ -38,46 +39,81 @@ def push_notification(title, content):
     except:
         pass
 
-def close_popup(page):
-    """关闭可能的弹窗通知"""
+def wait_for_turnstile_complete(page, timeout=60):
+    """等待Cloudflare Turnstile验证完全完成"""
+    print("🔄 等待Turnstile验证...")
+    start = time.time()
+    
+    while time.time() - start < timeout:
+        try:
+            # 方法1: 检查iframe是否消失
+            iframe = page.query_selector('iframe[src*="challenges.cloudflare.com"]')
+            if not iframe:
+                print("✅ Turnstile完成（iframe消失）")
+                return True
+            
+            # 方法2: 检查token是否生成
+            token = page.evaluate("""
+                () => {
+                    const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+                    if (!iframe) return null;
+                    try {
+                        return iframe.contentWindow?.document.querySelector('input[name="cf-turnstile-response"]')?.value;
+                    } catch { return null; }
+                }
+            """)
+            if token and len(token) > 20:
+                print("✅ Turnstile完成（获取到token）")
+                return True
+                
+        except:
+            pass
+        
+        print(f"⏳ Turnstile验证中... ({int(time.time()-start)}s)")
+        time.sleep(3)
+    
+    print("⚠️ Turnstile等待超时，尝试继续")
+    return False
+
+def is_logged_in(page):
+    """检查是否已登录"""
     try:
-        # 查找弹窗（根据截图：重要通知弹窗）
-        popup_selectors = [
+        # 检查URL
+        if '/user' in page.url:
+            return True
+        # 检查登出链接
+        if page.query_selector('a[href="/user/logout"]'):
+            return True
+        # 检查用户头像/信息
+        if page.query_selector('.user-avatar, .user-info, #user-center'):
+            return True
+        # 检查签到按钮（已登录才有）
+        if page.query_selector('button:has-text("每日签到"), button:has-text("明日再来"), #checkin-btn'):
+            return True
+        return False
+    except:
+        return False
+
+def close_popup(page):
+    """关闭可能的弹窗"""
+    try:
+        selectors = [
             'button:has-text("Read")',
-            'button:has-text("不再提醒")',
+            'button:has-text("不再提醒")', 
             '.swal2-confirm',
             '.layui-layer-btn0',
-            '[class*="modal"] button[class*="confirm"]'
+            '[class*="modal-close"]'
         ]
-        
-        for selector in popup_selectors:
+        for selector in selectors:
             try:
                 btn = page.query_selector(selector)
                 if btn and btn.is_visible():
-                    print(f"🔘 关闭弹窗: {selector}")
                     btn.click()
-                    time.sleep(1)  # 等待弹窗关闭
+                    time.sleep(1)
                     return True
             except:
                 continue
-        
-        # 备用：JS关闭常见弹窗
-        page.evaluate("""
-            () => {
-                // 关闭SweetAlert
-                if (typeof Swal !== 'undefined') Swal.close();
-                // 关闭Layui弹窗
-                if (typeof layer !== 'undefined') layer.closeAll();
-                // 关闭Bootstrap模态框
-                document.querySelectorAll('.modal').forEach(el => {
-                    const modal = bootstrap.Modal.getInstance(el);
-                    if (modal) modal.hide();
-                });
-                // 点击所有关闭按钮
-                document.querySelectorAll('button:contains("Read"), button:contains("不再提醒")').forEach(btn => btn.click());
-            }
-        """)
-        return True
+        return False
     except:
         return False
 
@@ -112,62 +148,83 @@ def sign_account(index, email, password):
             # 1️⃣ 访问主页
             print(f"🏠 访问主页...")
             page.goto(URL, wait_until='networkidle', timeout=60000)
-            time.sleep(8)
+            time.sleep(5)
             
             # 2️⃣ 检查是否已登录
-            if page.query_selector('a[href="/user/logout"]') or page.query_selector('.user-avatar'):
+            if is_logged_in(page):
                 print("✅ 已登录状态")
-                if '/user' in page.url:
-                    print("📍 已在用户中心页面")
-                else:
+                if '/user' not in page.url:
                     page.goto(f"{URL}/user", wait_until='networkidle', timeout=30000)
                     time.sleep(5)
             else:
-                # 3️⃣ 登录
+                # 3️⃣ 填写登录表单
                 print("📝 填写登录信息...")
                 
-                page.wait_for_selector('input[name="email"]', state='visible', timeout=20000)
+                # 等待邮箱输入框
+                page.wait_for_selector('input[name="email"]', state='visible', timeout=25000)
                 page.fill('input[name="email"]', email)
                 
+                # 填写密码
                 try:
                     page.fill('input[name="passwd"]', password)
                 except:
                     page.fill('input[name="password"]', password)
                 
-                if page.query_selector('iframe[src*="challenges.cloudflare.com"]'):
-                    print("🔄 等待Turnstile...")
-                    time.sleep(10)
-                else:
-                    time.sleep(3)
+                # 🔥 关键：等待Turnstile验证完成
+                wait_for_turnstile_complete(page, timeout=60)
+                time.sleep(2)  # 额外等待确保验证生效
                 
+                # 4️⃣ 点击登录
                 print("🔘 点击登录...")
                 page.click('button[type="submit"]', timeout=20000)
                 
+                # 5️⃣ 等待登录成功（多重检测）
                 print("⏳ 等待登录响应...")
-                try:
-                    page.wait_for_url(f"{URL}/user*", timeout=25000)
-                    print("✅ 登录成功")
-                except:
-                    time.sleep(5)
-                    if page.query_selector('a[href="/user/logout"]'):
-                        print("✅ 登录成功（检测到用户元素）")
-                    else:
-                        print("⚠️ 登录可能失败，尝试继续")
+                logged_in = False
                 
+                # 方式1: 等待URL
+                try:
+                    page.wait_for_url(f"{URL}/user*", timeout=30000)
+                    logged_in = True
+                    print("✅ 登录成功（URL）")
+                except PlaywrightTimeout:
+                    pass
+                
+                # 方式2: 等待元素
+                if not logged_in:
+                    try:
+                        page.wait_for_selector('a[href="/user/logout"], #checkin-btn', timeout=20000)
+                        logged_in = True
+                        print("✅ 登录成功（元素）")
+                    except PlaywrightTimeout:
+                        pass
+                
+                # 方式3: 轮询检查
+                if not logged_in:
+                    for _ in range(10):
+                        if is_logged_in(page):
+                            logged_in = True
+                            print("✅ 登录成功（轮询）")
+                            break
+                        time.sleep(2)
+                
+                if not logged_in:
+                    print("❌ 登录失败，保存截图")
+                    page.screenshot(path=f'login_failed_{int(time.time())}.png')
+                    return f"账号 {email}: ❌ 登录失败"
+                
+                # 确保在用户中心
                 if '/user' not in page.url:
                     page.goto(f"{URL}/user", wait_until='networkidle', timeout=30000)
                     time.sleep(5)
             
-            # 4️⃣  关键：关闭弹窗通知
+            # 6️⃣ 关闭可能的弹窗
             print("🔍 检查弹窗...")
             if close_popup(page):
                 print("✅ 弹窗已关闭")
-            else:
-                print("ℹ️  无弹窗")
-            
             time.sleep(2)
             
-            # 5️⃣ 执行签到
+            # 7️⃣ 执行签到
             print("📅 执行签到...")
             
             # 签到按钮选择器
@@ -198,54 +255,38 @@ def sign_account(index, email, password):
                 try:
                     result = page.evaluate("""
                         () => {
-                            // 查找包含"每日签到"或"签到"的按钮
+                            // 查找签到按钮
                             const buttons = document.querySelectorAll('button, a');
                             for (let btn of buttons) {
-                                if (btn.textContent.includes('每日签到') || btn.textContent.includes('签到')) {
+                                const text = btn.textContent.trim();
+                                if (text.includes('每日签到') || text.includes('签到')) {
                                     btn.click();
-                                    return 'button:' + btn.textContent.trim();
+                                    return 'button:' + text;
                                 }
                             }
-                            
-                            // 调用checkin函数
+                            // 调用函数
                             if (typeof checkin === 'function') {
                                 checkin();
                                 return 'function';
                             }
-                            
-                            // 尝试常见元素
-                            const elements = [
-                                document.getElementById('checkin-btn'),
-                                document.querySelector('.checkin-btn'),
-                                document.querySelector('[onclick*="checkin"]')
-                            ];
-                            
-                            for (let el of elements) {
-                                if (el) {
-                                    el.click();
-                                    return 'element';
-                                }
-                            }
-                            
                             return 'not_found';
                         }
                     """)
-                    print(f"🔘 JS执行结果: {result}")
-                    clicked = True
+                    print(f"🔘 JS结果: {result}")
                 except Exception as e:
-                    print(f"⚠️ JS触发失败: {e}")
+                    print(f"⚠️ JS失败: {e}")
             
-            # 6️⃣ 再次关闭可能的签到结果弹窗
+            # 再次关闭结果弹窗
             time.sleep(1)
             close_popup(page)
             
-            # 7️⃣ 等待并提取结果
-            print("⏳ 等待签到结果...")
+            # 8️⃣ 提取结果
+            print("⏳ 等待结果...")
             time.sleep(8)
             
             msg = None
             
-            # 提取结果
+            # 弹窗消息
             for selector in ['.msg', '.alert', '.layui-layer-content', '.swal2-html-container']:
                 try:
                     el = page.query_selector(selector)
@@ -253,7 +294,6 @@ def sign_account(index, email, password):
                         text = el.inner_text().strip()
                         if text and len(text) < 200:
                             msg = text
-                            print(f"📋 提取结果: {msg}")
                             break
                 except:
                     continue
@@ -262,20 +302,16 @@ def sign_account(index, email, password):
             if not msg:
                 page_text = page.text_content('body')
                 if '签到成功' in page_text or '获得' in page_text:
-                    import re
                     match = re.search(r'获得.*?(\d+\.?\d*)\s*(GB|MB)', page_text)
-                    if match:
-                        msg = f"✅ 签到成功，获得 {match.group(1)}{match.group(2)}"
-                    else:
-                        msg = "✅ 签到成功"
+                    msg = f"✅ 签到成功，获得 {match.group(1)}{match.group(2)}" if match else "✅ 签到成功"
                 elif '今日已签到' in page_text:
                     msg = "ℹ️ 今日已签到"
             
-            # 检查按钮变化
+            # 按钮变化
             if not msg:
                 try:
                     if page.query_selector('button:has-text("明日再来")'):
-                        msg = "✅ 签到成功（按钮变为'明日再来'）"
+                        msg = "✅ 签到成功（按钮变化）"
                 except:
                     pass
             
@@ -283,12 +319,17 @@ def sign_account(index, email, password):
                 print(f"🎉 结果: {msg}")
                 result_msg = f"账号 {email}: {msg}"
             else:
-                print("⚠️ 未检测到签到结果")
+                print("⚠️ 未检测到结果")
+                page.screenshot(path=f'checkin_{int(time.time())}.png')
                 result_msg = f"账号 {email}: ❓ 未检测到结果"
                     
         except Exception as e:
             print(f"💥 异常: {e}")
             result_msg = f"账号 {email}: {str(e)[:100]}"
+            try:
+                page.screenshot(path=f'error_{int(time.time())}.png')
+            except:
+                pass
         finally:
             browser.close()
     
