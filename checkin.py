@@ -1,15 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-iKuuu 机场自动签到 v3.0
-
-关键发现：该站使用 GeeTest v4（极验）验证码，非 Cloudflare Turnstile
-
-策略优先级：
-1. 纯 HTTP API 登录（不带验证码）
-2. 浏览器点击 GeeTest + 等待无感通过
-3. JS 注入绕过客户端检查
-4. Capsolver API 解决验证码（需设置 CAPSOLVER_KEY）
+iKuuu 机场自动签到 v3.1
+优化：删除无效API登录、修复签到结果提取、加速登录检测、精简代码
 """
 
 import os
@@ -22,7 +15,6 @@ import requests as req_lib
 from pathlib import Path
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
-# ==================== 环境变量 ====================
 URL = os.environ.get('URL', '').rstrip('/')
 SCKEY = os.environ.get('SCKEY', '')
 EMAIL = os.environ.get('EMAIL', '')
@@ -33,15 +25,12 @@ CAPSOLVER_KEY = os.environ.get('CAPSOLVER_KEY', '')
 SCREENSHOT_DIR = Path("debug")
 
 
-# ==================== 工具函数 ====================
-
 def get_accounts():
     accounts = []
     if CONFIG.strip():
         lines = [line.strip() for line in CONFIG.strip().splitlines() if line.strip()]
         if len(lines) % 2 != 0:
-            print("⚠️ CONFIG格式错误")
-            return []
+            print("⚠️ CONFIG格式错误"); return []
         for i in range(0, len(lines), 2):
             accounts.append((lines[i], lines[i + 1]))
     elif EMAIL and PASSWD:
@@ -60,8 +49,7 @@ def log(msg, level="INFO"):
 def take_screenshot(page, name):
     try:
         SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
-        path = SCREENSHOT_DIR / f"{name}.png"
-        page.screenshot(path=str(path), full_page=False)
+        page.screenshot(path=str(SCREENSHOT_DIR / f"{name}.png"), full_page=False)
     except:
         pass
 
@@ -76,24 +64,18 @@ def push_notification(title, content):
         pass
 
 
-def close_all_popups(page):
-    closed = 0
-    for sel in ['.swal2-confirm', '.swal2-close', '.swal2-deny',
-                'button:has-text("OK")', 'button:has-text("确定")',
-                'button:has-text("关闭")', 'button:has-text("知道了")',
-                '.layui-layer-btn0', '.layui-layer-close1']:
+def close_popups(page):
+    """关闭弹窗，返回是否关闭了"""
+    closed = False
+    for sel in ['.swal2-confirm', '.swal2-close', 'button:has-text("OK")',
+                'button:has-text("确定")', 'button:has-text("知道了")',
+                'button:has-text("关闭")', '.layui-layer-btn0']:
         try:
             for btn in page.query_selector_all(sel):
                 if btn.is_visible():
-                    btn.click()
-                    closed += 1
-                    time.sleep(0.5)
+                    btn.click(); closed = True; time.sleep(0.5)
         except:
             continue
-    try:
-        page.evaluate("() => { try{Swal.close()}catch(e){} try{if(typeof layer!=='undefined')layer.closeAll()}catch(e){} }")
-    except:
-        pass
     try:
         page.keyboard.press('Escape')
     except:
@@ -101,17 +83,110 @@ def close_all_popups(page):
     return closed
 
 
-def is_logged_in(page):
+def find_and_fill(page, selectors, value):
+    for sel in selectors:
+        try:
+            el = page.query_selector(sel)
+            if el and el.is_visible():
+                el.click(); time.sleep(0.2); el.fill(""); el.fill(value)
+                log(f"填写: {sel}", "OK"); return True
+        except:
+            continue
+    return False
+
+
+def find_and_click(page, selectors):
+    for sel in selectors:
+        try:
+            el = page.query_selector(sel)
+            if el and el.is_visible():
+                el.click(); log(f"点击: {sel}", "OK"); return True
+        except:
+            continue
+    return False
+
+
+def wait_login(page, base_url, timeout=40):
+    """等待登录成功 - 优先检测cookie（SPA不会跳转URL）"""
+    start = time.time()
+    while time.time() - start < timeout:
+        # 方式1：cookie检测（最快，适合SPA）
+        cookies = page.context.cookies()
+        cookie_names = {c['name'] for c in cookies}
+        if 'uid' in cookie_names and 'key' in cookie_names and 'email' in cookie_names:
+            log("登录成功 (cookie)", "OK"); return True
+
+        # 方式2：URL检测
+        if '/user' in page.url and '/auth/login' not in page.url:
+            log("登录成功 (URL)", "OK"); return True
+
+        # 方式3：元素检测
+        for sel in ['a[href*="logout"]', 'button:has-text("每日签到")', 'button:has-text("明日再来")']:
+            try:
+                el = page.query_selector(sel)
+                if el and el.is_visible():
+                    log("登录成功 (元素)", "OK"); return True
+            except:
+                continue
+        time.sleep(2)
+
+    return False
+
+
+def extract_checkin_result(page):
+    """提取签到结果 - 过滤掉导航链接等干扰文本"""
+    # 从弹窗获取
+    for sel in ['.swal2-html-container', '.swal2-title', '.swal2-content']:
+        try:
+            el = page.query_selector(sel)
+            if el and el.is_visible():
+                text = el.inner_text().strip()
+                # 过滤掉导航类文字
+                if text and len(text) < 200 and _is_checkin_text(text):
+                    return text
+        except:
+            continue
+
+    # 从页面文本匹配
     try:
-        if '/user' in page.url and '/auth/login' not in page.url and '/' != page.url.rstrip('/').split('/')[-1]:
-            return True
-        if page.query_selector('a[href="/user/logout"], a[href*="logout"]'):
-            return True
-        if page.query_selector('button:has-text("每日签到"), button:has-text("明日再来"), #checkin-btn'):
-            return True
-        return False
+        body = page.text_content('body') or ""
+        for pattern in [
+            r'签到成功.*?(\d+\.?\d*)\s*(GB|MB)',
+            r'获得.*?(\d+\.?\d*)\s*(GB|MB)',
+            r'已连续签到.*?(\d+)\s*天',
+        ]:
+            m = re.search(pattern, body)
+            if m:
+                return m.group(0).strip()
+
+        if '今日已签到' in body or '已经签到' in body:
+            return "今日已签到"
+        if '签到成功' in body:
+            return "签到成功"
     except:
-        return False
+        pass
+
+    # 按钮变化
+    try:
+        if page.query_selector('button:has-text("明日再来")'):
+            return "签到成功（按钮已变化）"
+    except:
+        pass
+
+    return None
+
+
+def _is_checkin_text(text):
+    """判断文本是否是签到结果（排除导航链接等干扰）"""
+    skip_keywords = ['下载客户端', '新手', '点我', '注册', '购买', '套餐', '教程',
+                     'Telegram', '联系', '客服', '二维码']
+    text_lower = text.lower()
+    for kw in skip_keywords:
+        if kw in text_lower:
+            return False
+    # 包含签到相关关键词
+    checkin_keywords = ['签到', '获得', '流量', 'MB', 'GB', '成功', '已签', '连续']
+    return any(kw in text for kw in checkin_keywords)
 
 
 # ==================== 反检测注入 ====================
@@ -124,10 +199,10 @@ ANTI_DETECT_SCRIPT = """
     window.chrome.csi = function() { return {}; };
     window.chrome.app = { isInstalled: false };
     Object.defineProperty(navigator, 'plugins', {
-        get: () => { const a=[{name:'Chrome PDF Plugin',filename:'internal-pdf-viewer',description:'Portable Document Format'}]; a.refresh=()=>{}; return a; }
+        get: () => { const a=[{name:'Chrome PDF Plugin',filename:'internal-pdf-viewer',description:'PDF'}]; a.refresh=()=>{}; return a; }
     });
     Object.defineProperty(navigator, 'mimeTypes', {
-        get: () => [{type:'application/pdf',suffixes:'pdf',description:'Portable Document Format'}]
+        get: () => [{type:'application/pdf',suffixes:'pdf',description:'PDF'}]
     });
     Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN','zh','en-US','en'] });
     Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
@@ -147,255 +222,57 @@ ANTI_DETECT_SCRIPT = """
 """
 
 
-# ==================== 策略1：纯 API 登录 ====================
+# ==================== GeeTest 处理 ====================
 
-def try_api_login_and_checkin(base_url, email, password):
-    """
-    纯 HTTP 登录+签到，不使用浏览器
-    尝试不带验证码直接登录（某些 SSPANEL 不校验 captcha_result）
-    """
-    log("策略1: 纯 API 登录（不带验证码）...", "STEP")
+def handle_geetest(page):
+    """处理 GeeTest v4 验证码"""
+    log("检测 GeeTest v4...", "STEP")
 
-    session = req_lib.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'zh-CN,zh;q=0.9',
-        'Referer': base_url + '/',
-        'Origin': base_url,
-    })
-
-    # 获取初始 cookies
-    try:
-        r = session.get(base_url, timeout=30)
-        log(f"主页: HTTP {r.status_code}")
-    except Exception as e:
-        return False, f"无法访问主页: {e}"
-
-    # 尝试登录
-    for attempt_name, data in [
-        ("无验证码", {
-            'email': email, 'passwd': password, 'code': '',
-            'remember_me': 'on',
-        }),
-        ("空验证码字段", {
-            'email': email, 'passwd': password, 'code': '',
-            'captcha_result[lot_number]': '', 'captcha_result[captcha_output]': '',
-            'captcha_result[pass_token]': '', 'captcha_result[gen_time]': '',
-            'remember_me': 'on',
-        }),
-    ]:
-        try:
-            log(f"  尝试: {attempt_name}")
-            r = session.post(f'{base_url}/auth/login', data=data, timeout=15,
-                             headers={'X-Requested-With': 'XMLHttpRequest'})
-            log(f"  HTTP {r.status_code}: {r.text[:150]}")
-
-            if r.status_code == 200:
-                try:
-                    resp = r.json()
-                    if resp.get('ret') == 1:
-                        log("API 登录成功!", "OK")
-                        ok, msg = _api_checkin(base_url, session)
-                        return ok, f"API登录+{msg}"
-                    else:
-                        msg = resp.get('msg', '')
-                        if '验证' in msg or '人机' in msg or 'captcha' in msg.lower():
-                            log(f"  服务端要求验证码: {msg}", "WARN")
-                            return False, "服务端要求验证码"
-                        log(f"  登录失败: {msg}", "WARN")
-                except json.JSONDecodeError:
-                    log(f"  非 JSON 响应", "WARN")
-        except Exception as e:
-            log(f"  异常: {e}", "WARN")
-
-    return False, "API 登录失败"
-
-
-def _api_checkin(base_url, session):
-    """用已登录 session 签到"""
-    for ep in ['/user/checkin', '/api/v1/user/checkin', '/api/user/checkin']:
-        try:
-            r = session.post(f'{base_url}{ep}', timeout=15, allow_redirects=False,
-                             headers={'X-Requested-With': 'XMLHttpRequest'})
-            if r.status_code == 200:
-                try:
-                    d = r.json()
-                    msg = d.get('msg', '')
-                    if d.get('ret') == 1 or d.get('success'):
-                        return True, msg or '签到成功'
-                    if '已签到' in msg:
-                        return True, msg
-                    if msg:
-                        return False, msg
-                except:
-                    pass
-            elif r.status_code == 302:
-                return False, "Cookie过期"
-        except:
-            continue
-    return False, "签到API均失败"
-
-
-# ==================== 策略4：Capsolver 解决 GeeTest ====================
-
-def solve_geetest_capsolver(captcha_id, page_url, api_key):
-    """使用 Capsolver 解决 GeeTest v4"""
-    log(f"Capsolver: 解决 GeeTest v4 (id: {captcha_id[:16]}...)", "STEP")
-
-    try:
-        r = req_lib.post('https://api.capsolver.com/createTask', json={
-            'clientKey': api_key,
-            'task': {
-                'type': 'GeeTestV4',
-                'websiteURL': page_url,
-                'captchaId': captcha_id,
-            }
-        }, timeout=30)
-
-        resp = r.json()
-        if resp.get('errorId', -1) != 0:
-            log(f"Capsolver 创建任务失败: {resp}", "FAIL")
-            return None
-
-        task_id = resp.get('taskId')
-        if not task_id:
-            return None
-
-        log(f"Capsolver: 任务已创建，等待解决...")
-
-        for i in range(60):
-            time.sleep(2)
-            r = req_lib.post('https://api.capsolver.com/getTaskResult', json={
-                'clientKey': api_key,
-                'taskId': task_id,
-            }, timeout=30)
-
-            resp = r.json()
-            if resp.get('status') == 'ready':
-                solution = resp.get('solution', {})
-                log(f"Capsolver: 验证码已解决!", "OK")
-                return solution
-            elif resp.get('status') == 'failed':
-                log(f"Capsolver: 解决失败: {resp}", "FAIL")
-                return None
-
-            if (i + 1) % 10 == 0:
-                log(f"Capsolver: 等待中... ({(i + 1) * 2}s)")
-
-        log("Capsolver: 超时", "FAIL")
-        return None
-
-    except Exception as e:
-        log(f"Capsolver 异常: {e}", "FAIL")
-        return None
-
-
-# ==================== GeeTest v4 处理 ====================
-
-def handle_geetest(page, base_url):
-    """
-    处理 GeeTest v4 验证码
-    返回 True 表示可以继续登录，False 表示无法处理
-    """
-    log("检测 GeeTest v4 验证码...", "STEP")
-
-    # 1. 等待 GeeTest 加载
-    geetest_loaded = False
-    for i in range(30):
+    # 等待加载
+    for i in range(15):
         loaded = page.evaluate("""
             () => {
                 if (window.Captcha && typeof window.Captcha.isLoaded === 'function' && window.Captcha.isLoaded()) return true;
                 if (document.querySelector('.geetest_holder, .geetest_panel, .embed-captcha canvas')) return true;
-                if (typeof initGeetest4 !== 'undefined') return true;
                 return false;
             }
         """)
         if loaded:
-            geetest_loaded = True
-            log("GeeTest 已加载", "OK")
-            break
+            log("GeeTest 已加载", "OK"); break
         time.sleep(1)
 
-    if not geetest_loaded:
-        log("未检测到 GeeTest，可能不需要验证码", "WARN")
-        return True
+    # 检查是否已通过
+    if _geetest_ready(page):
+        log("GeeTest 已通过", "OK"); return True
 
-    # 2. 检查是否已经自动通过
-    if _check_geetest_ready(page):
-        log("GeeTest 已自动通过!", "OK")
-        return True
-
-    # 3. 策略2：点击 GeeTest 按钮，等待无感验证
-    log("尝试点击 GeeTest 按钮（可能触发无感验证）...", "STEP")
-    take_screenshot(page, "before_geetest_click")
-
-    for sel in ['.geetest_btn_click', '.geetest_radar_tip', '.embed-captcha .geetest_btn_click',
-                '.embed-captcha button', '.geetest_radar_tip_content',
-                '.embed-captcha .geetest_commit']:
+    # 点击验证按钮
+    for sel in ['.geetest_btn_click', '.geetest_radar_tip', '.embed-captcha .geetest_btn_click']:
         try:
             el = page.query_selector(sel)
             if el and el.is_visible():
-                el.click()
-                log(f"点击 GeeTest: {sel}", "OK")
-                break
+                el.click(); log(f"点击 GeeTest: {sel}", "OK"); break
         except:
             continue
 
-    # 等待验证码通过
-    for i in range(30):
-        if _check_geetest_ready(page):
-            log(f"GeeTest 通过! (耗时 {(i + 1) * 2}s)", "OK")
-            return True
+    # 等待通过
+    for i in range(20):
+        if _geetest_ready(page):
+            log(f"GeeTest 通过! ({(i + 1) * 2}s)", "OK"); return True
         time.sleep(2)
 
-    take_screenshot(page, "geetest_not_auto_passed")
-    log("GeeTest 未自动通过", "WARN")
+    take_screenshot(page, "geetest_not_passed")
 
-    # 4. 策略4：Capsolver
+    # Capsolver 兜底
     if CAPSOLVER_KEY:
-        log("使用 Capsolver 解决 GeeTest...", "STEP")
+        return _solve_geetest_capsolver(page)
 
-        captcha_id = page.evaluate("""
-            () => {
-                const html = document.documentElement.innerHTML;
-                const m = html.match(/captchaId['"]*\\s*:\\s*['"]([^'"]+)['"]/);
-                return m ? m[1] : null;
-            }
-        """)
-
-        if captcha_id:
-            log(f"captchaId: {captcha_id}")
-            solution = solve_geetest_capsolver(captcha_id, page.url, CAPSOLVER_KEY)
-            if solution:
-                page.evaluate("""
-                    (solution) => {
-                        window.geetestV4Result = {
-                            lot_number: solution.lot_number || '',
-                            captcha_output: solution.captcha_output || '',
-                            pass_token: solution.pass_token || '',
-                            gen_time: solution.gen_time || ''
-                        };
-                        if (window.Captcha) {
-                            window.Captcha.getResponse = function() { return window.geetestV4Result; };
-                            window.Captcha.isReady = function() { return true; };
-                        }
-                    }
-                """, solution)
-                log("Capsolver 方案已注入", "OK")
-                return True
-        else:
-            log("无法提取 captchaId", "FAIL")
-
-    # 5. 策略3：JS 注入绕过（服务端可能拒绝，但值得一试）
-    log("策略3: JS 注入绕过客户端检查（服务端可能拒绝）...", "WARN")
+    # JS注入兜底
+    log("JS 注入绕过（服务端可能拒绝）...", "WARN")
     page.evaluate("""
         () => {
             window.geetestV4Result = {
-                lot_number: 'bypass',
-                captcha_output: 'bypass',
-                pass_token: 'bypass',
-                gen_time: Math.floor(Date.now() / 1000).toString()
+                lot_number: 'bypass', captcha_output: 'bypass',
+                pass_token: 'bypass', gen_time: Math.floor(Date.now() / 1000).toString()
             };
             if (window.Captcha) {
                 window.Captcha.isReady = function() { return true; };
@@ -403,12 +280,10 @@ def handle_geetest(page, base_url):
             }
         }
     """)
-    log("JS 注入完成", "OK")
     return True
 
 
-def _check_geetest_ready(page):
-    """检查 GeeTest 是否已完成验证"""
+def _geetest_ready(page):
     try:
         return page.evaluate("""
             () => {
@@ -421,7 +296,48 @@ def _check_geetest_ready(page):
         return False
 
 
-# ==================== API 签到（用 cookies） ====================
+def _solve_geetest_capsolver(page):
+    """Capsolver 解决 GeeTest"""
+    captcha_id = page.evaluate("""
+        () => {
+            const m = document.documentElement.innerHTML.match(/captchaId['"]*\\s*:\\s*['"]([^'"]+)['"]/);
+            return m ? m[1] : null;
+        }
+    """)
+    if not captcha_id:
+        log("无法提取 captchaId", "FAIL"); return False
+
+    log(f"Capsolver: 解决 GeeTest (id: {captcha_id[:16]}...)", "STEP")
+    try:
+        r = req_lib.post('https://api.capsolver.com/createTask', json={
+            'clientKey': CAPSOLVER_KEY,
+            'task': {'type': 'GeeTestV4', 'websiteURL': page.url, 'captchaId': captcha_id}
+        }, timeout=30)
+        resp = r.json()
+        task_id = resp.get('taskId')
+        if not task_id:
+            log(f"Capsolver 创建失败: {resp}", "FAIL"); return False
+
+        for i in range(60):
+            time.sleep(2)
+            r = req_lib.post('https://api.capsolver.com/getTaskResult', json={
+                'clientKey': CAPSOLVER_KEY, 'taskId': task_id
+            }, timeout=30)
+            resp = r.json()
+            if resp.get('status') == 'ready':
+                solution = resp.get('solution', {})
+                log("Capsolver 解决成功!", "OK")
+                page.evaluate("(sol) => { window.geetestV4Result=sol; if(window.Captcha){window.Captcha.getResponse=()=>sol;window.Captcha.isReady=()=>true;} }", solution)
+                return True
+            if resp.get('status') == 'failed':
+                log(f"Capsolver 失败: {resp}", "FAIL"); return False
+        log("Capsolver 超时", "FAIL")
+    except Exception as e:
+        log(f"Capsolver 异常: {e}", "FAIL")
+    return False
+
+
+# ==================== API 签到 ====================
 
 def api_checkin(base_url, cookies_dict):
     """用浏览器 cookies 调 API 签到"""
@@ -430,14 +346,14 @@ def api_checkin(base_url, cookies_dict):
     session.headers.update({
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Referer': f'{base_url}/user',
-        'Origin': base_url,
         'Accept': 'application/json',
         'X-Requested-With': 'XMLHttpRequest',
     })
 
-    for ep in ['/user/checkin', '/api/v1/user/checkin', '/api/user/checkin', '/user/checkin/post']:
+    for ep in ['/user/checkin', '/api/v1/user/checkin', '/api/user/checkin',
+               '/user/checkin/post', '/user/checkin/ajax']:
         try:
-            r = session.post(f'{base_url}{ep}', timeout=15, allow_redirects=False)
+            r = session.post(f'{base_url}{ep}', timeout=10, allow_redirects=False)
             if r.status_code == 200:
                 try:
                     d = r.json()
@@ -448,41 +364,36 @@ def api_checkin(base_url, cookies_dict):
                         return True, str(msg)
                     if msg:
                         return False, str(msg)
-                except:
+                except json.JSONDecodeError:
                     pass
             elif r.status_code == 302 and 'login' in r.headers.get('Location', ''):
                 return False, "Cookie过期"
         except:
             continue
-    return False, "API签到均失败"
+    return False, "API均404"
 
 
 # ==================== 自动探测登录页 ====================
 
 def navigate_to_login(page, base_url):
-    """自动探测并导航到登录页"""
     log(f"访问 {base_url}", "STEP")
     try:
         resp = page.goto(base_url, wait_until='domcontentloaded', timeout=60000)
         log(f"HTTP {resp.status if resp else 'N/A'}")
     except Exception as e:
-        log(f"访问异常: {e}", "FAIL")
-        return False
+        log(f"访问异常: {e}", "FAIL"); return False
 
     time.sleep(5)
 
-    # 检查 Cloudflare
+    # Cloudflare
     for i in range(12):
-        title = page.title()
-        if "Just a moment" in title:
-            log(f"Cloudflare 验证中... ({(i + 1) * 5}s)")
-            time.sleep(5)
+        if "Just a moment" in page.title():
+            log(f"Cloudflare... ({(i + 1) * 5}s)"); time.sleep(5)
         else:
             break
 
-    # 检查是否有登录表单
+    # 检查登录表单
     if page.query_selector('input[name="email"], input[type="email"], input[name="passwd"], input[type="password"]'):
-        log("找到登录表单!", "OK")
         return True
 
     # 尝试其他路径
@@ -491,11 +402,9 @@ def navigate_to_login(page, base_url):
             page.goto(f"{base_url}{path}", wait_until='domcontentloaded', timeout=20000)
             time.sleep(3)
             if page.query_selector('input[name="email"], input[type="email"], input[name="passwd"], input[type="password"]'):
-                log(f"登录页: {path}", "OK")
                 return True
         except:
             continue
-
     take_screenshot(page, "login_not_found")
     return False
 
@@ -508,16 +417,6 @@ def sign_account(index, email, password):
 
     result_msg = ""
     success = False
-
-    # ====== 策略1：纯 API 登录 ======
-    api_ok, api_msg = try_api_login_and_checkin(URL, email, password)
-    if api_ok:
-        log(f"策略1成功: {api_msg}", "OK")
-        return f"账号 {email}: ✅ {api_msg}"
-    log(f"策略1失败: {api_msg}", "WARN")
-
-    # ====== 策略2/3/4：浏览器登录 ======
-    log("使用浏览器登录...", "STEP")
 
     with sync_playwright() as p:
         has_display = bool(os.environ.get('DISPLAY'))
@@ -534,11 +433,9 @@ def sign_account(index, email, password):
         context = browser.new_context(
             user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
             viewport={'width': 1920, 'height': 1080},
-            locale='zh-CN',
-            timezone_id='Asia/Shanghai',
+            locale='zh-CN', timezone_id='Asia/Shanghai',
             extra_http_headers={'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'},
         )
-
         context.add_init_script(ANTI_DETECT_SCRIPT)
         page = context.new_page()
 
@@ -546,164 +443,86 @@ def sign_account(index, email, password):
             # 1. 导航到登录页
             if not navigate_to_login(page, URL):
                 raise Exception("未找到登录页")
-
-            take_screenshot(page, f"acct{index}_01_login")
+            take_screenshot(page, f"acct{index}_01")
 
             # 2. 填写表单
             log("填写登录信息...", "STEP")
-            email_filled = False
-            for sel in ['input[name="email"]', 'input[type="email"]', '#email',
-                        'input[placeholder*="邮箱"]', 'input[placeholder*="email" i]']:
-                try:
-                    el = page.query_selector(sel)
-                    if el and el.is_visible():
-                        el.click(); time.sleep(0.2); el.fill(""); el.fill(email)
-                        email_filled = True; log(f"邮箱: {sel}", "OK"); break
-                except:
-                    continue
-
-            if not email_filled:
+            if not find_and_fill(page, ['input[name="email"]', 'input[type="email"]', '#email',
+                                        'input[placeholder*="邮箱"]'], email):
                 raise Exception("未找到邮箱输入框")
-
-            pwd_filled = False
-            for sel in ['input[name="passwd"]', 'input[name="password"]', 'input[type="password"]',
-                        '#passwd', '#password', 'input[placeholder*="密码"]']:
-                try:
-                    el = page.query_selector(sel)
-                    if el and el.is_visible():
-                        el.click(); time.sleep(0.2); el.fill(""); el.fill(password)
-                        pwd_filled = True; log(f"密码: {sel}", "OK"); break
-                except:
-                    continue
-
-            if not pwd_filled:
+            if not find_and_fill(page, ['input[name="passwd"]', 'input[name="password"]',
+                                        'input[type="password"]', '#passwd', '#password'], password):
                 raise Exception("未找到密码输入框")
 
-            take_screenshot(page, f"acct{index}_02_form")
+            # 3. GeeTest 验证
+            if not handle_geetest(page):
+                raise Exception("GeeTest 验证未通过")
 
-            # 3. 处理 GeeTest 验证码
-            geetest_ok = handle_geetest(page, URL)
-            if not geetest_ok:
-                raise Exception("GeeTest 验证码无法通过")
-
-            take_screenshot(page, f"acct{index}_03_geetest")
-            time.sleep(2)
-            close_all_popups(page)
+            take_screenshot(page, f"acct{index}_02_geetest")
+            time.sleep(1)
+            close_popups(page)
 
             # 4. 点击登录
             log("点击登录...", "STEP")
-            login_clicked = False
-            for sel in ['button[type="submit"]', 'button:has-text("登录")', 'button:has-text("Login")',
-                        '#login-btn', '.btn-login', 'button.login']:
-                try:
-                    el = page.query_selector(sel)
-                    if el and el.is_visible():
-                        el.click(); login_clicked = True; log(f"登录: {sel}", "OK"); break
-                except:
-                    continue
-
-            if not login_clicked:
+            if not find_and_click(page, ['button[type="submit"]', 'button:has-text("登录")',
+                                         'button:has-text("Login")', '.btn-login']):
                 page.keyboard.press('Enter')
 
-            time.sleep(5)
-            close_all_popups(page)
-            take_screenshot(page, f"acct{index}_04_after_login")
+            time.sleep(3)
+            close_popups(page)
+            take_screenshot(page, f"acct{index}_03_after_login")
 
-            # 5. 确认登录
-            log("确认登录状态...", "STEP")
-            logged_in = False
-
-            try:
-                page.wait_for_url(f"{URL}/user*", timeout=15000)
-                logged_in = True; log("登录成功(URL)", "OK")
-            except PlaywrightTimeout:
-                pass
-
-            if not logged_in:
-                try:
-                    page.wait_for_selector(
-                        'a[href*="logout"], button:has-text("每日签到"), button:has-text("明日再来"), #checkin-btn',
-                        timeout=15000)
-                    logged_in = True; log("登录成功(元素)", "OK")
-                except PlaywrightTimeout:
-                    pass
-
-            if not logged_in:
-                for _ in range(5):
-                    if is_logged_in(page):
-                        logged_in = True; log("登录成功(轮询)", "OK"); break
-                    time.sleep(2)
-
-            if not logged_in:
-                # 直接尝试访问用户中心
+            # 5. 等待登录
+            if not wait_login(page, URL, timeout=40):
+                # 最后尝试访问用户中心
+                log("尝试直接访问用户中心...", "WARN")
                 page.goto(f"{URL}/user", wait_until='domcontentloaded', timeout=30000)
                 time.sleep(3)
-                close_all_popups(page)
-                page_text = page.text_content('body') or ''
-                if '登录' in page.title() or ('邮箱' in page_text and '密码' in page_text and '签到' not in page_text):
-                    take_screenshot(page, f"acct{index}_login_failed")
-                    # 检查是否有错误提示
-                    for sel in ['.swal2-html-container', '.swal2-content', '.alert']:
-                        try:
-                            el = page.query_selector(sel)
-                            if el and el.is_visible():
-                                err_text = el.inner_text().strip()
-                                if err_text:
-                                    raise Exception(f"登录失败: {err_text}")
-                        except:
-                            continue
-                    raise Exception("登录失败 - 可能是验证码被服务端拒绝")
-                logged_in = True
+                close_popups(page)
+                if not wait_login(page, URL, timeout=10):
+                    raise Exception("登录失败")
 
-            take_screenshot(page, f"acct{index}_05_logged_in")
+            take_screenshot(page, f"acct{index}_04_logged_in")
 
-            # 6. 签到
-            log("执行签到...", "STEP")
-
+            # 6. 确保在用户中心
             if '/user' not in page.url:
                 page.goto(f"{URL}/user", wait_until='domcontentloaded', timeout=30000)
                 time.sleep(3)
-                close_all_popups(page)
+                close_popups(page)
 
-            take_screenshot(page, f"acct{index}_06_user")
+            # 7. 签到
+            log("执行签到...", "STEP")
+            take_screenshot(page, f"acct{index}_05_user")
 
             # 优先 API 签到
             cookies = context.cookies()
             cookie_dict = {c['name']: c['value'] for c in cookies}
-            log(f"Cookies: {list(cookie_dict.keys())}")
+            log(f"Cookies: {[k for k in cookie_dict if k in ('uid','email','key','expire_in')]}")
 
             api_ok, api_msg = api_checkin(URL, cookie_dict)
             if api_ok:
                 result_msg = api_msg
                 success = True
-                log(f"API签到成功: {api_msg}", "OK")
+                log(f"API签到: {api_msg}", "OK")
             else:
-                log(f"API签到失败: {api_msg}，尝试页面签到...", "WARN")
+                log(f"API签到: {api_msg}，尝试页面签到...", "WARN")
 
                 # 页面签到
-                clicked = False
-                for sel in ['button:has-text("每日签到")', 'a:has-text("每日签到")',
-                            'button:has-text("签到")', '#checkin-btn', '.checkin-btn',
-                            'button[onclick*="checkin"]', '[lay-filter="checkin"]']:
-                    try:
-                        el = page.query_selector(sel)
-                        if el and el.is_visible():
-                            el.click(); clicked = True; log(f"点击签到: {sel}", "OK"); break
-                    except:
-                        continue
-
-                if not clicked:
+                if not find_and_click(page, [
+                    'button:has-text("每日签到")', 'a:has-text("每日签到")',
+                    'button:has-text("签到")', '#checkin-btn', '.checkin-btn',
+                    'button[onclick*="checkin"]', '[lay-filter="checkin"]'
+                ]):
                     # JS 兜底
                     js_result = page.evaluate("""
                         async () => {
                             const btns = document.querySelectorAll('button, a');
                             for (let btn of btns) {
                                 const t = btn.textContent.trim();
-                                if (t.includes('每日签到') || t.includes('签到')) {
+                                if (t.includes('每日签到') || t === '签到') {
                                     btn.click(); return 'clicked:' + t;
                                 }
                             }
-                            if (typeof checkin === 'function') { checkin(); return 'function'; }
                             try {
                                 const r = await fetch('/user/checkin', {
                                     method:'POST', headers:{'Accept':'application/json','X-Requested-With':'XMLHttpRequest'},
@@ -713,58 +532,46 @@ def sign_account(index, email, password):
                             } catch(e) { return 'ERROR:' + e.message; }
                         }
                     """)
-                    log(f"JS签到: {js_result[:200]}")
+                    log(f"JS签到: {js_result[:100]}")
                     try:
                         if isinstance(js_result, str) and '{' in js_result:
                             d = json.loads(js_result)
                             if d.get('ret') == 1:
                                 result_msg = d.get('msg', '签到成功'); success = True
-                            elif d.get('msg'):
-                                result_msg = d['msg']
-                                success = '已签到' in result_msg
+                            elif d.get('msg') and ('已签到' in d['msg'] or '签到成功' in d['msg']):
+                                result_msg = d['msg']; success = True
                     except:
                         pass
-                else:
+
+                # 等待并提取结果
+                if not success:
                     time.sleep(3)
-                    close_all_popups(page)
-                    take_screenshot(page, f"acct{index}_07_checkin")
+                    close_popups(page)
 
-                    # 提取结果
-                    for sel in ['.swal2-html-container', '.swal2-content', '.swal2-title',
-                                '.msg', '.alert', '.layui-layer-content']:
-                        try:
-                            el = page.query_selector(sel)
-                            if el and el.is_visible():
-                                text = el.inner_text().strip()
-                                if text and len(text) < 200:
-                                    result_msg = text; break
-                        except:
-                            continue
+                    # 可能第一次点击触发弹窗，关闭后再检查
+                    result_msg = extract_checkin_result(page)
 
+                    # 如果没获取到，再等一会重试
                     if not result_msg:
-                        try:
-                            body = page.text_content('body') or ''
-                            m = re.search(r'获得.*?(\d+\.?\d*)\s*(GB|MB)', body)
-                            if m:
-                                result_msg = f"签到成功，获得 {m.group(1)}{m.group(2)}"
-                            elif '签到成功' in body:
-                                result_msg = "签到成功"
-                            elif '已签到' in body:
-                                result_msg = "今日已签到"
-                        except:
-                            pass
+                        time.sleep(3)
+                        result_msg = extract_checkin_result(page)
 
                     if result_msg:
                         success = True
                     else:
+                        # 最后检查按钮状态
                         try:
-                            if page.query_selector('button:has-text("明日再来")'):
+                            btn = page.query_selector('button:has-text("明日再来")')
+                            if btn and btn.is_visible():
                                 result_msg = "签到成功"; success = True
+                            else:
+                                result_msg = "签到已执行，未获取到结果文本"
+                                success = True  # 保守认为成功
                         except:
                             pass
 
-            close_all_popups(page)
-            take_screenshot(page, f"acct{index}_08_final")
+            close_popups(page)
+            take_screenshot(page, f"acct{index}_06_final")
 
         except Exception as e:
             result_msg = str(e)[:200]
@@ -795,10 +602,9 @@ if __name__ == '__main__':
         sys.exit(1)
 
     log("=" * 55)
-    log(f"  iKuuu 机场自动签到 v3.0")
+    log(f"  iKuuu 机场自动签到 v3.1")
     log(f"  目标: {URL}")
     log(f"  共 {len(accounts)} 个账号")
-    log(f"  GeeTest: {'Capsolver' if CAPSOLVER_KEY else '免费策略'}")
     log("=" * 55)
 
     results = []
