@@ -39,6 +39,56 @@ def push_notification(title, content):
     except:
         pass
 
+def close_all_popups(page):
+    """关闭所有可能的弹窗"""
+    try:
+        # 查找并点击所有弹窗的确定按钮
+        popup_buttons = [
+            'button:has-text("OK")',
+            'button:has-text("确定")',
+            'button:has-text("关闭")',
+            '.swal2-confirm',
+            '.layui-layer-btn0',
+            '[class*="modal-close"]'
+        ]
+        
+        for selector in popup_buttons:
+            try:
+                buttons = page.query_selector_all(selector)
+                for btn in buttons:
+                    if btn.is_visible():
+                        btn.click()
+                        print(f"🔘 关闭弹窗: {selector}")
+                        time.sleep(0.5)
+            except:
+                continue
+        
+        # 使用JS关闭常见弹窗
+        page.evaluate("""
+            () => {
+                // 关闭SweetAlert
+                if (typeof Swal !== 'undefined') Swal.close();
+                // 关闭Layui弹窗
+                if (typeof layer !== 'undefined') layer.closeAll();
+                // 关闭所有模态框
+                document.querySelectorAll('.modal').forEach(el => {
+                    if (el.classList.contains('show')) {
+                        el.classList.remove('show');
+                        el.style.display = 'none';
+                    }
+                });
+                // 点击所有确定按钮
+                document.querySelectorAll('button').forEach(btn => {
+                    if (btn.textContent.includes('OK') || btn.textContent.includes('确定')) {
+                        btn.click();
+                    }
+                });
+            }
+        """)
+        return True
+    except:
+        return False
+
 def wait_for_turnstile_complete(page, timeout=60):
     """等待Cloudflare Turnstile验证完全完成"""
     print("🔄 等待Turnstile验证...")
@@ -46,13 +96,7 @@ def wait_for_turnstile_complete(page, timeout=60):
     
     while time.time() - start < timeout:
         try:
-            # 方法1: 检查iframe是否消失
-            iframe = page.query_selector('iframe[src*="challenges.cloudflare.com"]')
-            if not iframe:
-                print("✅ Turnstile完成（iframe消失）")
-                return True
-            
-            # 方法2: 检查token是否生成
+            # 方法1: 检查token是否生成
             token = page.evaluate("""
                 () => {
                     const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
@@ -64,6 +108,12 @@ def wait_for_turnstile_complete(page, timeout=60):
             """)
             if token and len(token) > 20:
                 print("✅ Turnstile完成（获取到token）")
+                return True
+            
+            # 方法2: 检查iframe是否消失
+            iframe = page.query_selector('iframe[src*="challenges.cloudflare.com"]')
+            if not iframe:
+                print("✅ Turnstile完成（iframe消失）")
                 return True
                 
         except:
@@ -78,41 +128,14 @@ def wait_for_turnstile_complete(page, timeout=60):
 def is_logged_in(page):
     """检查是否已登录"""
     try:
-        # 检查URL
         if '/user' in page.url:
             return True
-        # 检查登出链接
         if page.query_selector('a[href="/user/logout"]'):
             return True
-        # 检查用户头像/信息
         if page.query_selector('.user-avatar, .user-info, #user-center'):
             return True
-        # 检查签到按钮（已登录才有）
         if page.query_selector('button:has-text("每日签到"), button:has-text("明日再来"), #checkin-btn'):
             return True
-        return False
-    except:
-        return False
-
-def close_popup(page):
-    """关闭可能的弹窗"""
-    try:
-        selectors = [
-            'button:has-text("Read")',
-            'button:has-text("不再提醒")', 
-            '.swal2-confirm',
-            '.layui-layer-btn0',
-            '[class*="modal-close"]'
-        ]
-        for selector in selectors:
-            try:
-                btn = page.query_selector(selector)
-                if btn and btn.is_visible():
-                    btn.click()
-                    time.sleep(1)
-                    return True
-            except:
-                continue
         return False
     except:
         return False
@@ -150,6 +173,11 @@ def sign_account(index, email, password):
             page.goto(URL, wait_until='networkidle', timeout=60000)
             time.sleep(5)
             
+            # 🔥 关键：先关闭可能的初始弹窗
+            print("🔍 检查初始弹窗...")
+            close_all_popups(page)
+            time.sleep(2)
+            
             # 2️⃣ 检查是否已登录
             if is_logged_in(page):
                 print("✅ 已登录状态")
@@ -172,11 +200,21 @@ def sign_account(index, email, password):
                 
                 # 🔥 关键：等待Turnstile验证完成
                 wait_for_turnstile_complete(page, timeout=60)
-                time.sleep(2)  # 额外等待确保验证生效
+                time.sleep(3)  # 额外等待确保验证生效
+                
+                # 🔥 关键：再次关闭可能的弹窗（身份验证弹窗）
+                print("🔍 检查登录前弹窗...")
+                close_all_popups(page)
+                time.sleep(2)
                 
                 # 4️⃣ 点击登录
                 print("🔘 点击登录...")
                 page.click('button[type="submit"]', timeout=20000)
+                
+                # 🔥 关键：关闭登录后的弹窗
+                time.sleep(2)
+                close_all_popups(page)
+                time.sleep(2)
                 
                 # 5️⃣ 等待登录成功（多重检测）
                 print("⏳ 等待登录响应...")
@@ -218,13 +256,13 @@ def sign_account(index, email, password):
                     page.goto(f"{URL}/user", wait_until='networkidle', timeout=30000)
                     time.sleep(5)
             
-            # 6️⃣ 关闭可能的弹窗
-            print("🔍 检查弹窗...")
-            if close_popup(page):
+            # 🔥 关键：关闭用户中心弹窗
+            print("🔍 检查用户中心弹窗...")
+            if close_all_popups(page):
                 print("✅ 弹窗已关闭")
             time.sleep(2)
             
-            # 7️⃣ 执行签到
+            # 6️⃣ 执行签到
             print("📅 执行签到...")
             
             # 签到按钮选择器
@@ -276,11 +314,11 @@ def sign_account(index, email, password):
                 except Exception as e:
                     print(f"⚠️ JS失败: {e}")
             
-            # 再次关闭结果弹窗
+            # 关闭签到结果弹窗
             time.sleep(1)
-            close_popup(page)
+            close_all_popups(page)
             
-            # 8️⃣ 提取结果
+            # 7️⃣ 提取结果
             print("⏳ 等待结果...")
             time.sleep(8)
             
