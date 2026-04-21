@@ -2,8 +2,7 @@ name: iKuuu Check-in
 
 on:
   schedule:
-    - cron: '0 0 * * *'
-    - cron: '0 12 * * *'
+    - cron: '32 22 * * *'
   workflow_dispatch:
 
 jobs:
