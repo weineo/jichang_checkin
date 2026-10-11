@@ -11,8 +11,8 @@
 1. 本机装一次（只需一次）
    ```
    pip install playwright
-   python -m playwright install chromium
    ```
+   不用再 `playwright install chromium` —— 脚本会直接调用你本机已有的 **Edge**（找不到才回退 Chrome / 内置 chromium）。
 
 2. 取 Cookie（Cookie 过期时重做这一步）
    ```
@@ -20,14 +20,11 @@
    ```
    在弹出的窗口里正常登录（验证码自己点一下），脚本会自动抓取 Cookie、
    写进 `cookie.txt`、复制到剪贴板，并打开 GitHub Secret 设置页。
+   （默认不在终端打印完整 Cookie，需要看就加 `--show`。）
 
 3. 在仓库 `Settings → Secrets and variables → Actions` 新建 Secret：
    - 名称 **`COOKIE`**，值粘贴 `cookie.txt` 里的那一行
    - 多账号：每行一个，用 `python get_cookie.py --append` 追加
-
-   > 不想改工作流文件？也可以直接把 Cookie 放进**已有的 `CONFIG` secret**——
-   > `checkin.py` 会依次尝试 `COOKIE` → `CONFIG`，日志里会打印实际用的是哪个。
-   > （Cookie 方案下原来放账号密码的 `CONFIG` 已经不需要了，用来放 Cookie 正好。）
 
 之后无需再管，每天 22:32 UTC 自动签到。
 
