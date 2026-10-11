@@ -33,9 +33,7 @@ import requests
 
 DEFAULT_URL = 'https://ikuuu.top'
 URL = (os.environ.get('URL', '') or DEFAULT_URL).rstrip('/')
-# 优先读 COOKIE；若你不想改工作流文件，也可以直接把 Cookie 放进原有的 CONFIG secret
-COOKIE_RAW = os.environ.get('COOKIE', '') or os.environ.get('CONFIG', '')
-COOKIE_FROM = 'COOKIE' if os.environ.get('COOKIE', '').strip() else ('CONFIG' if os.environ.get('CONFIG', '').strip() else '')
+COOKIE_RAW = os.environ.get('COOKIE', '')
 SCKEY = os.environ.get('SCKEY', '')
 ONLY_TEST = os.environ.get('COOKIE_ONLY_TEST', '') in ('1', 'true', 'True', 'yes')
 
@@ -188,9 +186,8 @@ def main():
     log("=" * 55)
 
     if not COOKIE_RAW.strip():
-        log("未配置 COOKIE（或 CONFIG）Secret —— 请先用 get_cookie.py 获取并写入", "FAIL")
+        log("未配置 COOKIE Secret —— 请先用 get_cookie.py 获取并写入", "FAIL")
         sys.exit(1)
-    log(f"Cookie 来源: {COOKIE_FROM}")
 
     accounts = parse_cookie_lines(COOKIE_RAW)
     if not accounts:
