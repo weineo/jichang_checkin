@@ -17,29 +17,14 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Install xvfb
-        run: sudo apt-get update && sudo apt-get install -y xvfb
-
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          python -m playwright install chromium
-          python -m playwright install-deps chromium
+        run: pip install -r requirements.txt
 
       - name: Run check-in
         env:
+          # 主凭据：登录 Cookie，一个账号一行（用 get_cookie.py 获取）
+          COOKIE: ${{ secrets.COOKIE }}
+          # 可选
           URL: ${{ secrets.URL }}
-          EMAIL: ${{ secrets.EMAIL }}
-          PASSWD: ${{ secrets.PASSWD }}
-          CONFIG: ${{ secrets.CONFIG }}
           SCKEY: ${{ secrets.SCKEY }}
-          CAPSOLVER_KEY: ${{ secrets.CAPSOLVER_KEY }}
-        run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python checkin.py
-
-      - name: Upload screenshots
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: screenshots-${{ github.run_number }}
-          path: debug/
-          retention-days: 3
+        run: python checkin.py
