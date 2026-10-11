@@ -1,43 +1,47 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-iKuuu 机场自动签到 v3.1
-优化：删除无效API登录、修复签到结果提取、加速登录检测、精简代码
+iKuuu 机场自动签到 v5.0 —— Cookie 版
+
+为什么这样写：
+  站点签到接口是  POST /user/checkin  （见前端 malio.js 的 function checkin()，
+  jQuery ajax、dataType json、无参数、无 CSRF token、成功回调读 data.msg）。
+  也就是说：只要带上有效的登录 Cookie，接口就能签到 ——
+  完全不需要打开登录页，也就不需要过 GeeTest v4 验证码。
+
+  所以在本地登录一次、把 Cookie 存进仓库 Secret，之后每天由 Actions 直接调接口。
+  零验证码、零浏览器、零第三方依赖、零现金成本。
+
+需要的仓库 Secret：
+  COOKIE   必填。一个账号一行。可以放多行实现多账号。
+           格式（分号分隔即可，顺序无所谓）：
+           uid=xxx; email=xxx; key=xxx; expire_in=xxx
+  URL      可选。默认 https://ikuuu.top
+  SCKEY    可选。Server酱推送（填了就推送签到结果到微信）。
+  COOKIE_ONLY_TEST  可选。设成 1 时只校验 Cookie 是否有效，不执行签到。
+
+本地怎么拿到 COOKIE：见同目录 get_cookie.py。
 """
 
 import os
 import sys
-import time
-import random
 import re
+import time
 import json
-import requests as req_lib
-from pathlib import Path
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
-URL = os.environ.get('URL', '').rstrip('/')
+import requests
+
+DEFAULT_URL = 'https://ikuuu.top'
+URL = (os.environ.get('URL', '') or DEFAULT_URL).rstrip('/')
+# 优先读 COOKIE；若你不想改工作流文件，也可以直接把 Cookie 放进原有的 CONFIG secret
+COOKIE_RAW = os.environ.get('COOKIE', '') or os.environ.get('CONFIG', '')
+COOKIE_FROM = 'COOKIE' if os.environ.get('COOKIE', '').strip() else ('CONFIG' if os.environ.get('CONFIG', '').strip() else '')
 SCKEY = os.environ.get('SCKEY', '')
-EMAIL = os.environ.get('EMAIL', '')
-PASSWD = os.environ.get('PASSWD', '')
-CONFIG = os.environ.get('CONFIG', '')
-CAPSOLVER_KEY = os.environ.get('CAPSOLVER_KEY', '')
+ONLY_TEST = os.environ.get('COOKIE_ONLY_TEST', '') in ('1', 'true', 'True', 'yes')
 
-SCREENSHOT_DIR = Path("debug")
-
-
-def get_accounts():
-    accounts = []
-    if CONFIG.strip():
-        lines = [line.strip() for line in CONFIG.strip().splitlines() if line.strip()]
-        if len(lines) % 2 != 0:
-            print("⚠️ CONFIG格式错误"); return []
-        for i in range(0, len(lines), 2):
-            accounts.append((lines[i], lines[i + 1]))
-    elif EMAIL and PASSWD:
-        accounts.append((EMAIL, PASSWD))
-    else:
-        print("❌ 未配置账号")
-    return accounts
+CHECKIN_PATH = '/user/checkin'
+UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+      '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36')
 
 
 def log(msg, level="INFO"):
@@ -46,581 +50,198 @@ def log(msg, level="INFO"):
     print(f"[{ts}] {icon} {msg}", flush=True)
 
 
-def take_screenshot(page, name):
+def parse_cookie_lines(raw):
+    """把 Secret 里的原始文本解析成 [(标签, cookie字典), ...]"""
+    accounts = []
+    for idx, line in enumerate(raw.splitlines()):
+        line = line.strip().strip(';')
+        if not line or line.startswith('#'):
+            continue
+        jar = {}
+        for part in line.split(';'):
+            part = part.strip()
+            if not part or '=' not in part:
+                continue
+            k, v = part.split('=', 1)
+            jar[k.strip()] = v.strip()
+        if not jar:
+            log(f"第 {idx + 1} 行不是合法 Cookie，已跳过", "WARN")
+            continue
+        accounts.append((idx + 1, jar))
+    return accounts
+
+
+def mask(v):
+    if not v:
+        return ''
+    return v if len(v) <= 6 else f"{v[:3]}…{v[-2:]}"
+
+
+def mask_equal(s):
+    """把 a@b.com 掩成 a***@b.com，避免账号出现在公开的 Actions 日志里"""
+    if not s:
+        return ''
+    if '@' in s:
+        name, _, domain = s.partition('@')
+        head = name[:1] if name else ''
+        return f"{head}***@{domain}"
+    return mask(s)
+
+
+def describe(jar):
+    """脱敏描述，避免把 Cookie / 账号打到公开的 Actions 日志里"""
+    uid = jar.get('uid', '')
+    email = jar.get('email', '')
+    tips = [k for k in ('uid', 'key', 'email', 'expire_in') if k in jar]
+    who = mask_equal(email) if email else (f"uid={mask(uid)}" if uid else "未知账号")
+    exp = jar.get('expire_in', '')
+    if exp.isdigit():
+        try:
+            left = int(exp) - int(time.time())
+            exp = f"，剩余约 {left // 86400} 天" if left > 0 else "，⚠️ 已过期"
+        except Exception:
+            exp = ''
+    else:
+        exp = ''
+    return f"{who}（字段: {','.join(tips)}{exp}）"
+
+
+def build_session(jar):
+    s = requests.Session()
+    s.cookies.update(jar)
+    s.headers.update({
+        'User-Agent': UA,
+        'Referer': f'{URL}/user',
+        'Origin': URL,
+        'Accept': 'application/json, text/javascript, */*; q=0.01',
+        'X-Requested-With': 'XMLHttpRequest',
+    })
+    return s
+
+
+def probe_alive(session):
+    """访问 /user 判断 Cookie 是否还在登录态（未登录会被重定向到 /auth/login）"""
     try:
-        SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
-        page.screenshot(path=str(SCREENSHOT_DIR / f"{name}.png"), full_page=False)
-    except:
-        pass
+        r = session.get(f'{URL}/user', timeout=20, allow_redirects=False)
+        if r.status_code in (301, 302, 303, 307, 308):
+            loc = r.headers.get('Location', '')
+            return ('login' not in loc), f"跳转 {loc}"
+        if r.status_code == 200:
+            body = r.text
+            # 新版前端登录页会带「登录」表单；已登录的用户中心应有 签到 / 流量 之类字样
+            if 'id="password"' in body or 'initGeetest4' in body:
+                return False, "返回的是登录页"
+            return True, "HTTP 200"
+        return False, f"HTTP {r.status_code}"
+    except Exception as e:
+        return False, f"请求异常 {e}"
 
 
-def push_notification(title, content):
+def do_checkin(session):
+    """POST /user/checkin，返回 (是否成功, 结果文本)"""
+    try:
+        r = session.post(f'{URL}{CHECKIN_PATH}', timeout=25, allow_redirects=False)
+    except Exception as e:
+        return False, f"请求异常: {e}"
+
+    if r.status_code in (301, 302, 303, 307, 308):
+        loc = r.headers.get('Location', '')
+        if 'login' in loc or 'auth' in loc:
+            return False, "Cookie 已失效（被重定向到登录页）"
+        return False, f"被重定向: {loc}"
+
+    raw = (r.text or '').strip()
+    try:
+        d = json.loads(raw)
+    except ValueError:
+        # 不是 JSON：多半是登录页 HTML
+        if 'initGeetest4' in raw or 'id="password"' in raw:
+            return False, "Cookie 已失效（返回登录页）"
+        return False, f"非 JSON 响应（HTTP {r.status_code}）: {raw[:200]}"
+
+    msg = d.get('msg') or d.get('data') or ''
+    if d.get('ret') == 1 or d.get('success') is True:
+        return True, str(msg) or '签到成功'
+    if '已签到' in str(msg) or '已经签到' in str(msg) or '签到成功' in str(msg):
+        return True, str(msg)
+    if msg:
+        return False, str(msg)
+    return False, f"未知响应: {raw[:200]}"
+
+
+def push(title, content):
     if not SCKEY:
         return
     try:
-        req_lib.post(f"https://sctapi.ftqq.com/{SCKEY}.send",
-                     data={"title": title, "desp": content}, timeout=10)
-    except:
-        pass
-
-
-def close_popups(page):
-    """关闭弹窗，返回是否关闭了"""
-    closed = False
-    for sel in ['.swal2-confirm', '.swal2-close', 'button:has-text("OK")',
-                'button:has-text("确定")', 'button:has-text("知道了")',
-                'button:has-text("关闭")', '.layui-layer-btn0']:
-        try:
-            for btn in page.query_selector_all(sel):
-                if btn.is_visible():
-                    btn.click(); closed = True; time.sleep(0.5)
-        except:
-            continue
-    try:
-        page.keyboard.press('Escape')
-    except:
-        pass
-    return closed
-
-
-def find_and_fill(page, selectors, value):
-    for sel in selectors:
-        try:
-            el = page.query_selector(sel)
-            if el and el.is_visible():
-                el.click(); time.sleep(0.2); el.fill(""); el.fill(value)
-                log(f"填写: {sel}", "OK"); return True
-        except:
-            continue
-    return False
-
-
-def find_and_click(page, selectors):
-    for sel in selectors:
-        try:
-            el = page.query_selector(sel)
-            if el and el.is_visible():
-                el.click(); log(f"点击: {sel}", "OK"); return True
-        except:
-            continue
-    return False
-
-
-def wait_login(page, base_url, timeout=40):
-    """等待登录成功 - 优先检测cookie（SPA不会跳转URL）"""
-    start = time.time()
-    while time.time() - start < timeout:
-        # 方式1：cookie检测（最快，适合SPA）
-        cookies = page.context.cookies()
-        cookie_names = {c['name'] for c in cookies}
-        if 'uid' in cookie_names and 'key' in cookie_names and 'email' in cookie_names:
-            log("登录成功 (cookie)", "OK"); return True
-
-        # 方式2：URL检测
-        if '/user' in page.url and '/auth/login' not in page.url:
-            log("登录成功 (URL)", "OK"); return True
-
-        # 方式3：元素检测
-        for sel in ['a[href*="logout"]', 'button:has-text("每日签到")', 'button:has-text("明日再来")']:
-            try:
-                el = page.query_selector(sel)
-                if el and el.is_visible():
-                    log("登录成功 (元素)", "OK"); return True
-            except:
-                continue
-        time.sleep(2)
-
-    return False
-
-
-def extract_checkin_result(page):
-    """提取签到结果 - 过滤掉导航链接等干扰文本"""
-    # 从弹窗获取
-    for sel in ['.swal2-html-container', '.swal2-title', '.swal2-content']:
-        try:
-            el = page.query_selector(sel)
-            if el and el.is_visible():
-                text = el.inner_text().strip()
-                # 过滤掉导航类文字
-                if text and len(text) < 200 and _is_checkin_text(text):
-                    return text
-        except:
-            continue
-
-    # 从页面文本匹配
-    try:
-        body = page.text_content('body') or ""
-        for pattern in [
-            r'签到成功.*?(\d+\.?\d*)\s*(GB|MB)',
-            r'获得.*?(\d+\.?\d*)\s*(GB|MB)',
-            r'已连续签到.*?(\d+)\s*天',
-        ]:
-            m = re.search(pattern, body)
-            if m:
-                return m.group(0).strip()
-
-        if '今日已签到' in body or '已经签到' in body:
-            return "今日已签到"
-        if '签到成功' in body:
-            return "签到成功"
-    except:
-        pass
-
-    # 按钮变化
-    try:
-        if page.query_selector('button:has-text("明日再来")'):
-            return "签到成功（按钮已变化）"
-    except:
-        pass
-
-    return None
-
-
-def _is_checkin_text(text):
-    """判断文本是否是签到结果（排除导航链接等干扰）"""
-    skip_keywords = ['下载客户端', '新手', '点我', '注册', '购买', '套餐', '教程',
-                     'Telegram', '联系', '客服', '二维码']
-    text_lower = text.lower()
-    for kw in skip_keywords:
-        if kw in text_lower:
-            return False
-    # 包含签到相关关键词
-    checkin_keywords = ['签到', '获得', '流量', 'MB', 'GB', '成功', '已签', '连续']
-    return any(kw in text for kw in checkin_keywords)
-
-
-# ==================== 反检测注入 ====================
-
-ANTI_DETECT_SCRIPT = """
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    if (!window.chrome) window.chrome = {};
-    window.chrome.runtime = { connect: function(){}, sendMessage: function(){} };
-    window.chrome.loadTimes = function() { return {}; };
-    window.chrome.csi = function() { return {}; };
-    window.chrome.app = { isInstalled: false };
-    Object.defineProperty(navigator, 'plugins', {
-        get: () => { const a=[{name:'Chrome PDF Plugin',filename:'internal-pdf-viewer',description:'PDF'}]; a.refresh=()=>{}; return a; }
-    });
-    Object.defineProperty(navigator, 'mimeTypes', {
-        get: () => [{type:'application/pdf',suffixes:'pdf',description:'PDF'}]
-    });
-    Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN','zh','en-US','en'] });
-    Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
-    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
-    Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
-    if (!navigator.connection) {
-        Object.defineProperty(navigator, 'connection', {
-            get: () => ({ effectiveType: '4g', rtt: 50, downlink: 10, saveData: false })
-        });
-    }
-    const gP = WebGLRenderingContext.prototype.getParameter;
-    WebGLRenderingContext.prototype.getParameter = function(p) {
-        if (p === 37445) return 'Intel Inc.';
-        if (p === 37446) return 'Intel Iris OpenGL Engine';
-        return gP.call(this, p);
-    };
-"""
-
-
-# ==================== GeeTest 处理 ====================
-
-def handle_geetest(page):
-    """处理 GeeTest v4 验证码"""
-    log("检测 GeeTest v4...", "STEP")
-
-    # 等待加载
-    for i in range(15):
-        loaded = page.evaluate("""
-            () => {
-                if (window.Captcha && typeof window.Captcha.isLoaded === 'function' && window.Captcha.isLoaded()) return true;
-                if (document.querySelector('.geetest_holder, .geetest_panel, .embed-captcha canvas')) return true;
-                return false;
-            }
-        """)
-        if loaded:
-            log("GeeTest 已加载", "OK"); break
-        time.sleep(1)
-
-    # 检查是否已通过
-    if _geetest_ready(page):
-        log("GeeTest 已通过", "OK"); return True
-
-    # 点击验证按钮
-    for sel in ['.geetest_btn_click', '.geetest_radar_tip', '.embed-captcha .geetest_btn_click']:
-        try:
-            el = page.query_selector(sel)
-            if el and el.is_visible():
-                el.click(); log(f"点击 GeeTest: {sel}", "OK"); break
-        except:
-            continue
-
-    # 等待通过
-    for i in range(20):
-        if _geetest_ready(page):
-            log(f"GeeTest 通过! ({(i + 1) * 2}s)", "OK"); return True
-        time.sleep(2)
-
-    take_screenshot(page, "geetest_not_passed")
-
-    # Capsolver 兜底
-    if CAPSOLVER_KEY:
-        return _solve_geetest_capsolver(page)
-
-    # JS注入兜底
-    log("JS 注入绕过（服务端可能拒绝）...", "WARN")
-    page.evaluate("""
-        () => {
-            window.geetestV4Result = {
-                lot_number: 'bypass', captcha_output: 'bypass',
-                pass_token: 'bypass', gen_time: Math.floor(Date.now() / 1000).toString()
-            };
-            if (window.Captcha) {
-                window.Captcha.isReady = function() { return true; };
-                window.Captcha.getResponse = function() { return window.geetestV4Result; };
-            }
-        }
-    """)
-    return True
-
-
-def _geetest_ready(page):
-    try:
-        return page.evaluate("""
-            () => {
-                if (window.Captcha && typeof window.Captcha.isReady === 'function' && window.Captcha.isReady()) return true;
-                if (window.geetestV4Result && window.geetestV4Result.lot_number) return true;
-                return false;
-            }
-        """)
-    except:
-        return False
-
-
-def _solve_geetest_capsolver(page):
-    """Capsolver 解决 GeeTest"""
-    captcha_id = page.evaluate("""
-        () => {
-            const m = document.documentElement.innerHTML.match(/captchaId['"]*\\s*:\\s*['"]([^'"]+)['"]/);
-            return m ? m[1] : null;
-        }
-    """)
-    if not captcha_id:
-        log("无法提取 captchaId", "FAIL"); return False
-
-    log(f"Capsolver: 解决 GeeTest (id: {captcha_id[:16]}...)", "STEP")
-    try:
-        r = req_lib.post('https://api.capsolver.com/createTask', json={
-            'clientKey': CAPSOLVER_KEY,
-            'task': {'type': 'GeeTestV4', 'websiteURL': page.url, 'captchaId': captcha_id}
-        }, timeout=30)
-        resp = r.json()
-        task_id = resp.get('taskId')
-        if not task_id:
-            log(f"Capsolver 创建失败: {resp}", "FAIL"); return False
-
-        for i in range(60):
-            time.sleep(2)
-            r = req_lib.post('https://api.capsolver.com/getTaskResult', json={
-                'clientKey': CAPSOLVER_KEY, 'taskId': task_id
-            }, timeout=30)
-            resp = r.json()
-            if resp.get('status') == 'ready':
-                solution = resp.get('solution', {})
-                log("Capsolver 解决成功!", "OK")
-                page.evaluate("(sol) => { window.geetestV4Result=sol; if(window.Captcha){window.Captcha.getResponse=()=>sol;window.Captcha.isReady=()=>true;} }", solution)
-                return True
-            if resp.get('status') == 'failed':
-                log(f"Capsolver 失败: {resp}", "FAIL"); return False
-        log("Capsolver 超时", "FAIL")
+        requests.post(f'https://sctapi.ftqq.com/{SCKEY}.send',
+                      data={'title': title, 'desp': content}, timeout=15)
+        log("推送已发送", "OK")
     except Exception as e:
-        log(f"Capsolver 异常: {e}", "FAIL")
-    return False
+        log(f"推送失败: {e}", "WARN")
 
 
-# ==================== API 签到 ====================
+def main():
+    log("=" * 55)
+    log("  iKuuu 机场自动签到 v5.0（Cookie 版）")
+    log(f"  站点: {URL}")
+    log(f"  模式: {'仅校验 Cookie' if ONLY_TEST else '签到'}")
+    log("=" * 55)
 
-def api_checkin(base_url, cookies_dict):
-    """用浏览器 cookies 调 API 签到"""
-    session = req_lib.Session()
-    session.cookies.update(cookies_dict)
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Referer': f'{base_url}/user',
-        'Accept': 'application/json',
-        'X-Requested-With': 'XMLHttpRequest',
-    })
+    if not COOKIE_RAW.strip():
+        log("未配置 COOKIE（或 CONFIG）Secret —— 请先用 get_cookie.py 获取并写入", "FAIL")
+        sys.exit(1)
+    log(f"Cookie 来源: {COOKIE_FROM}")
 
-    for ep in ['/user/checkin', '/api/v1/user/checkin', '/api/user/checkin',
-               '/user/checkin/post', '/user/checkin/ajax']:
-        try:
-            r = session.post(f'{base_url}{ep}', timeout=10, allow_redirects=False)
-            if r.status_code == 200:
-                try:
-                    d = r.json()
-                    msg = d.get('msg', d.get('data', ''))
-                    if d.get('ret') == 1 or d.get('success'):
-                        return True, msg or '签到成功'
-                    if '已签到' in str(msg):
-                        return True, str(msg)
-                    if msg:
-                        return False, str(msg)
-                except json.JSONDecodeError:
-                    pass
-            elif r.status_code == 302 and 'login' in r.headers.get('Location', ''):
-                return False, "Cookie过期"
-        except:
-            continue
-    return False, "API均404"
-
-
-# ==================== 自动探测登录页 ====================
-
-def navigate_to_login(page, base_url):
-    log(f"访问 {base_url}", "STEP")
-    try:
-        resp = page.goto(base_url, wait_until='domcontentloaded', timeout=60000)
-        log(f"HTTP {resp.status if resp else 'N/A'}")
-    except Exception as e:
-        log(f"访问异常: {e}", "FAIL"); return False
-
-    time.sleep(5)
-
-    # Cloudflare
-    for i in range(12):
-        if "Just a moment" in page.title():
-            log(f"Cloudflare... ({(i + 1) * 5}s)"); time.sleep(5)
-        else:
-            break
-
-    # 检查登录表单
-    if page.query_selector('input[name="email"], input[type="email"], input[name="passwd"], input[type="password"]'):
-        return True
-
-    # 尝试其他路径
-    for path in ['/auth/login', '/#/auth/login', '/login', '/#/login']:
-        try:
-            page.goto(f"{base_url}{path}", wait_until='domcontentloaded', timeout=20000)
-            time.sleep(3)
-            if page.query_selector('input[name="email"], input[type="email"], input[name="passwd"], input[type="password"]'):
-                return True
-        except:
-            continue
-    take_screenshot(page, "login_not_found")
-    return False
-
-
-# ==================== 主签到流程 ====================
-
-def sign_account(index, email, password):
-    log(f"\n{'=' * 25} 账号 {index + 1} {'=' * 25}")
-    log(f"账号: {email[:3]}***@{email.split('@')[-1] if '@' in email else '***'}")
-
-    result_msg = ""
-    success = False
-
-    with sync_playwright() as p:
-        has_display = bool(os.environ.get('DISPLAY'))
-        headless = not has_display
-        log(f"模式: {'有头(xvfb)' if not headless else '无头'}")
-
-        browser = p.chromium.launch(
-            headless=headless,
-            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
-                  '--disable-gpu', '--no-first-run', '--disable-blink-features=AutomationControlled',
-                  '--window-size=1920,1080']
-        )
-
-        context = browser.new_context(
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-            viewport={'width': 1920, 'height': 1080},
-            locale='zh-CN', timezone_id='Asia/Shanghai',
-            extra_http_headers={'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'},
-        )
-        context.add_init_script(ANTI_DETECT_SCRIPT)
-        page = context.new_page()
-
-        try:
-            # 1. 导航到登录页
-            if not navigate_to_login(page, URL):
-                raise Exception("未找到登录页")
-            take_screenshot(page, f"acct{index}_01")
-
-            # 2. 填写表单
-            log("填写登录信息...", "STEP")
-            if not find_and_fill(page, ['input[name="email"]', 'input[type="email"]', '#email',
-                                        'input[placeholder*="邮箱"]'], email):
-                raise Exception("未找到邮箱输入框")
-            if not find_and_fill(page, ['input[name="passwd"]', 'input[name="password"]',
-                                        'input[type="password"]', '#passwd', '#password'], password):
-                raise Exception("未找到密码输入框")
-
-            # 3. GeeTest 验证
-            if not handle_geetest(page):
-                raise Exception("GeeTest 验证未通过")
-
-            take_screenshot(page, f"acct{index}_02_geetest")
-            time.sleep(1)
-            close_popups(page)
-
-            # 4. 点击登录
-            log("点击登录...", "STEP")
-            if not find_and_click(page, ['button[type="submit"]', 'button:has-text("登录")',
-                                         'button:has-text("Login")', '.btn-login']):
-                page.keyboard.press('Enter')
-
-            time.sleep(3)
-            close_popups(page)
-            take_screenshot(page, f"acct{index}_03_after_login")
-
-            # 5. 等待登录
-            if not wait_login(page, URL, timeout=40):
-                # 最后尝试访问用户中心
-                log("尝试直接访问用户中心...", "WARN")
-                page.goto(f"{URL}/user", wait_until='domcontentloaded', timeout=30000)
-                time.sleep(3)
-                close_popups(page)
-                if not wait_login(page, URL, timeout=10):
-                    raise Exception("登录失败")
-
-            take_screenshot(page, f"acct{index}_04_logged_in")
-
-            # 6. 确保在用户中心
-            if '/user' not in page.url:
-                page.goto(f"{URL}/user", wait_until='domcontentloaded', timeout=30000)
-                time.sleep(3)
-                close_popups(page)
-
-            # 7. 签到
-            log("执行签到...", "STEP")
-            take_screenshot(page, f"acct{index}_05_user")
-
-            # 优先 API 签到
-            cookies = context.cookies()
-            cookie_dict = {c['name']: c['value'] for c in cookies}
-            log(f"Cookies: {[k for k in cookie_dict if k in ('uid','email','key','expire_in')]}")
-
-            api_ok, api_msg = api_checkin(URL, cookie_dict)
-            if api_ok:
-                result_msg = api_msg
-                success = True
-                log(f"API签到: {api_msg}", "OK")
-            else:
-                log(f"API签到: {api_msg}，尝试页面签到...", "WARN")
-
-                # 页面签到
-                if not find_and_click(page, [
-                    'button:has-text("每日签到")', 'a:has-text("每日签到")',
-                    'button:has-text("签到")', '#checkin-btn', '.checkin-btn',
-                    'button[onclick*="checkin"]', '[lay-filter="checkin"]'
-                ]):
-                    # JS 兜底
-                    js_result = page.evaluate("""
-                        async () => {
-                            const btns = document.querySelectorAll('button, a');
-                            for (let btn of btns) {
-                                const t = btn.textContent.trim();
-                                if (t.includes('每日签到') || t === '签到') {
-                                    btn.click(); return 'clicked:' + t;
-                                }
-                            }
-                            try {
-                                const r = await fetch('/user/checkin', {
-                                    method:'POST', headers:{'Accept':'application/json','X-Requested-With':'XMLHttpRequest'},
-                                    credentials:'same-origin'
-                                });
-                                return await r.text();
-                            } catch(e) { return 'ERROR:' + e.message; }
-                        }
-                    """)
-                    log(f"JS签到: {js_result[:100]}")
-                    try:
-                        if isinstance(js_result, str) and '{' in js_result:
-                            d = json.loads(js_result)
-                            if d.get('ret') == 1:
-                                result_msg = d.get('msg', '签到成功'); success = True
-                            elif d.get('msg') and ('已签到' in d['msg'] or '签到成功' in d['msg']):
-                                result_msg = d['msg']; success = True
-                    except:
-                        pass
-
-                # 等待并提取结果
-                if not success:
-                    time.sleep(3)
-                    close_popups(page)
-
-                    # 可能第一次点击触发弹窗，关闭后再检查
-                    result_msg = extract_checkin_result(page)
-
-                    # 如果没获取到，再等一会重试
-                    if not result_msg:
-                        time.sleep(3)
-                        result_msg = extract_checkin_result(page)
-
-                    if result_msg:
-                        success = True
-                    else:
-                        # 最后检查按钮状态
-                        try:
-                            btn = page.query_selector('button:has-text("明日再来")')
-                            if btn and btn.is_visible():
-                                result_msg = "签到成功"; success = True
-                            else:
-                                result_msg = "签到已执行，未获取到结果文本"
-                                success = True  # 保守认为成功
-                        except:
-                            pass
-
-            close_popups(page)
-            take_screenshot(page, f"acct{index}_06_final")
-
-        except Exception as e:
-            result_msg = str(e)[:200]
-            success = False
-            log(f"异常: {e}", "FAIL")
-            take_screenshot(page, f"acct{index}_error")
-        finally:
-            try:
-                context.close()
-                browser.close()
-            except:
-                pass
-
-    if success:
-        return f"账号 {email}: ✅ {result_msg}"
-    else:
-        return f"账号 {email}: ❌ {result_msg}"
-
-
-# ==================== 入口 ====================
-
-if __name__ == '__main__':
-    if not URL:
-        print("❌ URL 未配置"); sys.exit(1)
-
-    accounts = get_accounts()
+    accounts = parse_cookie_lines(COOKIE_RAW)
     if not accounts:
+        log("COOKIE 内容无法解析", "FAIL")
         sys.exit(1)
 
-    log("=" * 55)
-    log(f"  iKuuu 机场自动签到 v3.1")
-    log(f"  目标: {URL}")
-    log(f"  共 {len(accounts)} 个账号")
-    log("=" * 55)
-
+    log(f"共 {len(accounts)} 个账号")
     results = []
-    for idx, (email, pwd) in enumerate(accounts):
-        results.append(sign_account(idx, email, pwd))
-        if idx < len(accounts) - 1:
-            time.sleep(random.randint(30, 60))
+
+    for n, (_, jar) in enumerate(accounts, 1):
+        label = mask_equal(jar.get('email', '')) or (f"uid={mask(jar.get('uid', ''))}" if jar.get('uid') else f"账号{n}")
+        log(f"\n{'-' * 20} 账号 {n} {'-' * 20}")
+        log(f"身份: {describe(jar)}")
+        session = build_session(jar)
+
+        alive, why = probe_alive(session)
+        if not alive:
+            log(f"Cookie 不可用: {why}", "FAIL")
+            results.append(f"{label}: ❌ Cookie 失效（{why}），请重新运行 get_cookie.py 并更新 Secret")
+            continue
+        log(f"Cookie 有效（{why}）", "OK")
+
+        if ONLY_TEST:
+            results.append(f"{label}: ✅ Cookie 有效")
+            continue
+
+        ok, msg = do_checkin(session)
+        if ok:
+            log(f"签到成功: {msg}", "OK")
+            results.append(f"{label}: ✅ {msg}")
+        else:
+            log(f"签到失败: {msg}", "FAIL")
+            results.append(f"{label}: ❌ {msg}")
+
+        time.sleep(3)
 
     if SCKEY and results:
-        push_notification("机场签到", "## 📊 签到结果\n\n" + "\n\n".join(f"- {r}" for r in results))
+        push("机场签到", "## 📊 iKuuu 签到结果\n\n" + "\n\n".join(f"- {r}" for r in results))
 
     log("\n" + "=" * 55)
     for r in results:
         log(r, "OK" if "✅" in r else "FAIL")
     log("=" * 55)
-    log("🏁 完成")
+
+    expired = [r for r in results if "Cookie 失效" in r]
+    if expired:
+        log("❗ 有 Cookie 已失效，请重新运行 get_cookie.py 并更新仓库 Secret", "FAIL")
 
     if all("❌" in r for r in results):
         sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

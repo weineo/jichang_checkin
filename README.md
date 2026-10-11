@@ -1,23 +1,48 @@
-# 通用机场签到😍<br/>
->只要机场网站''' Powered by SSPANEL ''',就可以进行签到。要确认是否是''' Powered by SSPANEL '''，在机场首页滑倒最底端就可以看到。例如：
-![Y0}SY$J`8837H8T5GXM1DZY](https://user-images.githubusercontent.com/21276183/214764546-4f66333a-cb9b-420e-8260-697d26fb4547.png)
-## 作用
->每天进行签到，获取额外的流量奖励
+# iKuuu 签到（Cookie 版）
 
-## 推送方式
-  🚀🚀该脚本采用的是<a href = 'https://sct.ftqq.com/r/5126'>Server酱</a>的推送方式，如果不需要推送，就下面的SCKEY参数的值设置为<b>空</b>就行
+站点登录页新增了极验 GeeTest v4 交互式验证码，自动化登录已不可行。
+本方案绕开登录：签到接口 `POST /user/checkin` 只认登录 Cookie，
+所以在本地登录一次把 Cookie 存进仓库 Secret，之后每天由 Actions 直接调接口。
 
-# 部署过程
- 
-1. 右上角Fork此仓库
-2. 然后到`Settings`→`Secrets and variables`→`Actions` 新建以下机密：
+**零验证码、零浏览器、零第三方依赖、零费用。**
 
-| 参数   | 是否必须  | 内容  | 
-| ------------ | ------------ | ------------ |
-| CONFIG| 是  | 账号密码  |
-| SCKEY  | 否  | Sever酱秘钥  |
-<br/>
-<b>其中URL的值必须是机场网站的地址，例如：https://example.com</b>,尾部不要加''' / '''号 config写法：一行账号一行密码
+## 三步走
 
-3. 到`Actions`中创建一个workflow，运行一次，以后每天项目都会自动运行。<br/>
-4. 最后，可以到Run sign查看签到情况，同时也会也会将签到详情推送到Sever酱。
+1. 本机装一次（只需一次）
+   ```
+   pip install playwright
+   python -m playwright install chromium
+   ```
+
+2. 取 Cookie（Cookie 过期时重做这一步）
+   ```
+   python get_cookie.py
+   ```
+   在弹出的窗口里正常登录（验证码自己点一下），脚本会自动抓取 Cookie、
+   写进 `cookie.txt`、复制到剪贴板，并打开 GitHub Secret 设置页。
+
+3. 在仓库 `Settings → Secrets and variables → Actions` 新建 Secret：
+   - 名称 **`COOKIE`**，值粘贴 `cookie.txt` 里的那一行
+   - 多账号：每行一个，用 `python get_cookie.py --append` 追加
+
+   > 不想改工作流文件？也可以直接把 Cookie 放进**已有的 `CONFIG` secret**——
+   > `checkin.py` 会依次尝试 `COOKIE` → `CONFIG`，日志里会打印实际用的是哪个。
+   > （Cookie 方案下原来放账号密码的 `CONFIG` 已经不需要了，用来放 Cookie 正好。）
+
+之后无需再管，每天 22:32 UTC 自动签到。
+
+## 文件说明
+
+| 文件 | 用途 |
+|---|---|
+| `checkin.py` | 签到主程序（Cookie 版，仅依赖 requests） |
+| `get_cookie.py` | 本地取 Cookie 的小工具 |
+| `requirements.txt` | 依赖（只剩 requests） |
+| `checkin_solver.py` | 备选：打码平台版（接 Capsolver/2Captcha，需付费，暂未使用） |
+
+## Cookie 什么时候会失效？
+
+脚本每次会检查 Cookie 是否还在登录态；失效时会在日志和推送里明确提示
+「请重新运行 get_cookie.py」。登录时勾选 **Remember Me** 可以让 Cookie 活得更久。
+
+只校验不签到（想确认 Cookie 还有效时用）：把 Secret `COOKIE_ONLY_TEST` 设为 `1`。

@@ -1,2 +1,4 @@
-playwright>=1.40.0
 requests>=2.28.0
+# 说明：Cookie 版签到（checkin.py）只需要 requests，不再需要 playwright。
+# 如果你以后想切回打码平台版（checkin_solver.py），再补回下面两行：
+# playwright>=1.40.0
