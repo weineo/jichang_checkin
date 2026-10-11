@@ -30,16 +30,18 @@ import subprocess
 import sys
 import time
 import webbrowser
+from urllib.parse import urlparse
 
 LOGIN_URL = 'https://ikuuu.top/auth/login'
 USER_URL = 'https://ikuuu.top/user'
+SITE_HOST = urlparse(LOGIN_URL).hostname or 'ikuuu.top'
 SECRETS_PAGE = 'https://github.com/weineo/jichang_checkin/settings/secrets/actions'
 HERE = os.path.dirname(os.path.abspath(__file__))
 COOKIE_FILE = os.path.join(HERE, 'cookie.txt')
 PROFILE_DIR = os.path.join(HERE, 'browser_profile')
 
 NEEDED = ('uid', 'key', 'email')
-# 这些是统计/主题类 Cookie，跟登录态无关，不必带进 Secret
+# 统计/主题类 Cookie，跟登录态无关，不必带进 Secret
 DROP = {'_ga', '_gid', '_gat', '_gcl_au', 'cf_clearance', 'PHPSESSID'}
 
 
@@ -61,10 +63,16 @@ def to_clipboard(text):
 
 
 def build_cookie_string(cookies):
+    """只保留面板自己域名的 Cookie。
+    注意：浏览器里还混着 msn.com / bing.com / gcaptcha4.geetest.com 的 Cookie
+    （Windows 和 Edge 自动写的），全带上会让 Cookie 头膨胀到 5K+ 甚至被服务端拒收。"""
     parts = []
     for c in cookies:
-        name = c.get('name')
-        if not name or name in DROP:
+        name = c.get('name') or ''
+        dom = (c.get('domain') or '').lstrip('.').lower()
+        if not name or name in DROP or name.startswith('_ga') or name.startswith('_gid'):
+            continue
+        if not (dom == SITE_HOST or dom.endswith('.' + SITE_HOST)):
             continue
         if c.get('value') is None:
             continue
@@ -82,7 +90,7 @@ def save_cookie(cookie_str, append):
     return len(lines)
 
 
-def finish(cookie_str, append):
+def finish(cookie_str, append, show=False):
     n = save_cookie(cookie_str, append)
     ok = to_clipboard(cookie_str)
     print()
@@ -91,11 +99,16 @@ def finish(cookie_str, append):
     log(f"{'✅ 已复制到剪贴板' if ok else '⚠️ 剪贴板复制失败，请手动打开 cookie.txt 复制'}")
     log("=" * 64)
     log("")
-    log("下一步：把下面这一整行粘进 GitHub Secret（名称必须叫 COOKIE）：")
+    log("下一步：去 GitHub 新建/更新 Secret，名称必须叫 COOKIE，值直接粘贴（已在剪贴板）：")
     log(SECRETS_PAGE)
     log("")
-    print(cookie_str)
-    print()
+    if show:
+        print(cookie_str)
+        print()
+    else:
+        keys = [p.split('=', 1)[0] for p in cookie_str.split('; ')]
+        log(f"（为防凭据泄露，这里不打印完整值。字段：{', '.join(keys)}；"
+            f"长度 {len(cookie_str)}。要看完整值请加 --show，或打开 cookie.txt）")
     try:
         webbrowser.open(SECRETS_PAGE)
         log("已帮你打开 Secret 设置页。")
@@ -103,7 +116,7 @@ def finish(cookie_str, append):
         pass
 
 
-def run_browser(append):
+def run_browser(append, show=False):
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -115,11 +128,29 @@ def run_browser(append):
     log("正在启动浏览器（用的是独立配置目录，不影响你平时的浏览器）…")
 
     with sync_playwright() as p:
-        ctx = p.chromium.launch_persistent_context(
-            PROFILE_DIR, headless=False,
-            viewport={'width': 1280, 'height': 900},
-            args=['--disable-blink-features=AutomationControlled'],
-        )
+        # 优先复用本机已装的 Edge / Chrome —— 这样不必再下载 Playwright 自带的 chromium
+        ctx = None
+        last_err = None
+        for label, kw in (('本机 Edge', {'channel': 'msedge'}),
+                          ('本机 Chrome', {'channel': 'chrome'}),
+                          ('Playwright 内置 chromium', {})):
+            try:
+                ctx = p.chromium.launch_persistent_context(
+                    PROFILE_DIR, headless=False,
+                    viewport={'width': 1280, 'height': 900},
+                    args=['--disable-blink-features=AutomationControlled'],
+                    **kw,
+                )
+                log(f"已启动：{label}")
+                break
+            except Exception as e:
+                last_err = e
+                log(f"  {label} 启动失败：{str(e)[:140]}")
+        if ctx is None:
+            log("❌ 没有任何可用浏览器。请执行一次：python -m playwright install chromium")
+            log(f"最后错误：{last_err}")
+            sys.exit(1)
+
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.goto(LOGIN_URL, wait_until='domcontentloaded', timeout=60000)
 
@@ -132,14 +163,19 @@ def run_browser(append):
         deadline = time.time() + 480
         got = None
         while time.time() < deadline:
-            cookies = ctx.cookies()
+            try:
+                cookies = ctx.cookies()
+            except Exception:
+                log("❌ 浏览器窗口被关闭了，没能取到 Cookie。重新运行一次即可。")
+                sys.exit(1)
+
             jar = {c['name']: c['value'] for c in cookies}
             if all(k in jar and jar[k] for k in NEEDED):
+                # 用「访问 /user 会不会被弹回登录页」来确认真的登进去了
                 try:
                     page.goto(USER_URL, wait_until='domcontentloaded', timeout=30000)
                     time.sleep(2)
-                    body = page.content()
-                    if 'initGeetest4' in body or 'id="password"' in body:
+                    if '/login' in (page.url or '') or page.query_selector('#password, .embed-captcha'):
                         log("检测到仍在登录页，请继续完成登录…")
                         time.sleep(3)
                         continue
@@ -162,23 +198,24 @@ def run_browser(append):
     missing = [k for k in NEEDED if k not in have]
     if missing:
         log(f"⚠️ 抓到的 Cookie 里缺少字段 {missing} —— 可能还没登录成功，请重试。")
-    finish(cookie_str, append)
+    finish(cookie_str, append, show)
 
 
 def main():
     ap = argparse.ArgumentParser(description="获取 iKuuu 登录 Cookie")
     ap.add_argument('--append', action='store_true', help='追加一行（多账号）而不是覆盖')
     ap.add_argument('--manual', metavar='COOKIE', help='直接传入 Cookie 字符串（不启动浏览器）')
+    ap.add_argument('--show', action='store_true', help='在终端完整打印 Cookie（默认不打印，防泄露）')
     args = ap.parse_args()
 
     if args.manual:
         s = args.manual.strip()
         if not s:
             log("传入的 Cookie 是空的"); sys.exit(1)
-        finish(s, args.append)
+        finish(s, args.append, args.show)
         return
 
-    run_browser(args.append)
+    run_browser(args.append, args.show)
 
 
 if __name__ == '__main__':
