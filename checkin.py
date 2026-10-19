@@ -96,12 +96,27 @@ def describe(jar):
     if exp.isdigit():
         try:
             left = int(exp) - int(time.time())
-            exp = f"，剩余约 {left // 86400} 天" if left > 0 else "，⚠️ 已过期"
+            if left > 0:
+                d = left / 86400
+                exp = f"，剩余约 {d:.1f} 天" if d < 2 else f"，剩余约 {int(d)} 天"
+            else:
+                exp = "，⚠️ 已过期"
         except Exception:
             exp = ''
     else:
         exp = ''
     return f"{who}（字段: {','.join(tips)}{exp}）"
+
+
+def days_left(jar):
+    """Cookie 剩余天数；取不到 expire_in 时返回 None"""
+    exp = jar.get('expire_in', '')
+    if exp.isdigit():
+        try:
+            return (int(exp) - int(time.time())) / 86400
+        except Exception:
+            return None
+    return None
 
 
 def build_session(jar):
@@ -196,11 +211,18 @@ def main():
 
     log(f"共 {len(accounts)} 个账号")
     results = []
+    warnings = []
 
     for n, (_, jar) in enumerate(accounts, 1):
         label = mask_equal(jar.get('email', '')) or (f"uid={mask(jar.get('uid', ''))}" if jar.get('uid') else f"账号{n}")
         log(f"\n{'-' * 20} 账号 {n} {'-' * 20}")
         log(f"身份: {describe(jar)}")
+
+        left = days_left(jar)
+        if left is not None and left <= 1.5:
+            log(f"Cookie 只剩约 {left:.1f} 天 —— 建议尽快重跑 get_cookie.py 换新", "WARN")
+            warnings.append(f"{label} 的 Cookie 仅剩约 {left:.1f} 天，请重跑 get_cookie.py")
+
         session = build_session(jar)
 
         alive, why = probe_alive(session)
@@ -224,8 +246,12 @@ def main():
 
         time.sleep(3)
 
-    if SCKEY and results:
-        push("机场签到", "## 📊 iKuuu 签到结果\n\n" + "\n\n".join(f"- {r}" for r in results))
+    if SCKEY and (results or warnings):
+        body = "## 📊 iKuuu 签到结果\n\n"
+        if warnings:
+            body += "### ⚠️ Cookie 即将过期\n\n" + "\n".join(f"- {w}" for w in warnings) + "\n\n"
+        body += "\n\n".join(f"- {r}" for r in results)
+        push("机场签到", body)
 
     log("\n" + "=" * 55)
     for r in results:
