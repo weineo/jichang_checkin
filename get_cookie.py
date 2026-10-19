@@ -154,6 +154,27 @@ def run_browser(append, show=False):
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.goto(LOGIN_URL, wait_until='domcontentloaded', timeout=60000)
 
+        # 顺手勾上「Remember Me」—— 能让登录态明显活得更久，少刷新几次
+        for _ in range(20):
+            try:
+                done = page.evaluate("""
+                    () => {
+                        const el = document.querySelector('#remember-me');
+                        if (!el) return false;
+                        if (!el.checked) {
+                            el.checked = true;
+                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                        return true;
+                    }
+                """)
+                if done:
+                    log("已自动勾选「Remember Me」（可延长 Cookie 有效期）")
+                    break
+            except Exception:
+                pass
+            time.sleep(1)
+
         log("")
         log("=" * 64)
         log("请在弹出的窗口里完成登录（邮箱 + 密码 + 验证码）")
